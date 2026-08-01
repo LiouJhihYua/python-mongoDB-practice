@@ -13,8 +13,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from app.database import COL_AUDIT
-from app.models.base import clean_all, shift_of, utcnow
+from app.database import T_AUDIT, fetch_all
+from app.models.base import shift_of, utcnow
 
 #: 不得寫入稽核紀錄的敏感欄位
 REDACTED_KEYS = frozenset(
@@ -38,44 +38,46 @@ def redact(value: Any) -> Any:
     return value
 
 
+def _serialisable(value: Any) -> Any:
+    """稽核內容要能存成 JSONB，時間類物件先轉字串。"""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _serialisable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_serialisable(v) for v in value]
+    return value
+
+
 async def record_api(
     db, actor: str | None, method: str, path: str, status_code: int, duration_ms: float, query: str = ""
 ) -> None:
     now = utcnow()
-    await db[COL_AUDIT].insert_one(
-        {
-            "kind": KIND_API,
-            "actor": actor or "(未登入)",
-            "method": method,
-            "path": path,
-            "query": query,
-            "status_code": status_code,
-            "success": status_code < 400,
-            "duration_ms": round(duration_ms, 1),
-            "timestamp": now,
-            "shift": shift_of(now),
-        }
+    await db.execute(
+        f"""
+        INSERT INTO {T_AUDIT}
+            (kind, actor, method, path, query, status_code, success, duration_ms, timestamp, shift)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        """,
+        KIND_API, actor or "(未登入)", method, path, query,
+        status_code, status_code < 400, round(duration_ms, 1), now, shift_of(now),
     )
 
 
 async def record_change(
-    db, actor: str, action: str, collection: str, key: str, payload: dict | None = None
+    db, actor: str, action: str, table_name: str, key: str, payload: dict | None = None
 ) -> None:
     """主檔異動的欄位層級稽核。"""
     now = utcnow()
-    await db[COL_AUDIT].insert_one(
-        {
-            "kind": KIND_DATA,
-            "actor": actor,
-            "action": action,
-            "collection": collection,
-            "key": key,
-            "fields": sorted(payload) if payload else [],
-            "payload": redact(payload) if payload else None,
-            "success": True,
-            "timestamp": now,
-            "shift": shift_of(now),
-        }
+    cleaned = _serialisable(redact(payload)) if payload else None
+    await db.execute(
+        f"""
+        INSERT INTO {T_AUDIT}
+            (kind, actor, action, table_name, key, fields, payload, success, timestamp, shift)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8, $9)
+        """,
+        KIND_DATA, actor, action, table_name, key,
+        sorted(payload) if payload else [], cleaned, now, shift_of(now),
     )
 
 
@@ -87,37 +89,39 @@ async def list_audit(
     success: bool | None = None,
     limit: int = 200,
 ) -> list[dict]:
-    filt: dict[str, Any] = {}
-    if kind:
-        filt["kind"] = kind
-    if actor:
-        filt["actor"] = actor
-    if path:
-        filt["path"] = {"$regex": path}
-    if success is not None:
-        filt["success"] = success
-    cursor = db[COL_AUDIT].find(filt).sort([("timestamp", -1)]).limit(limit)
-    return clean_all(await cursor.to_list(length=limit))
+    return await fetch_all(
+        db,
+        f"""
+        SELECT * FROM {T_AUDIT}
+        WHERE ($1::text IS NULL OR kind = $1)
+          AND ($2::text IS NULL OR actor = $2)
+          AND ($3::text IS NULL OR path LIKE '%' || $3 || '%')
+          AND ($4::boolean IS NULL OR success = $4)
+        ORDER BY timestamp DESC, id DESC
+        LIMIT $5
+        """,
+        kind, actor, path, success, limit,
+    )
 
 
 async def activity_summary(db, start: datetime, end: datetime) -> list[dict]:
     """各使用者的操作次數與失敗率。"""
-    rows = await db[COL_AUDIT].aggregate(
-        [
-            {"$match": {"timestamp": {"$gte": start, "$lt": end}}},
-            {
-                "$group": {
-                    "_id": "$actor",
-                    "operations": {"$sum": 1},
-                    "failures": {"$sum": {"$cond": ["$success", 0, 1]}},
-                }
-            },
-            {"$sort": {"operations": -1}},
-        ]
-    ).to_list(length=None)
+    rows = await fetch_all(
+        db,
+        f"""
+        SELECT actor,
+               count(*)                                    AS operations,
+               count(*) FILTER (WHERE NOT success)         AS failures
+        FROM {T_AUDIT}
+        WHERE timestamp >= $1 AND timestamp < $2
+        GROUP BY actor
+        ORDER BY operations DESC
+        """,
+        start, end,
+    )
     return [
         {
-            "actor": r["_id"],
+            "actor": r["actor"],
             "operations": r["operations"],
             "failures": r["failures"],
             "failure_rate": round(r["failures"] / r["operations"], 4) if r["operations"] else 0.0,

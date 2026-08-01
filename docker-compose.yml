@@ -1,14 +1,18 @@
 services:
-  mongo:
-    image: mongo:7
-    container_name: mes-mongo
+  postgres:
+    image: postgres:16-alpine
+    container_name: mes-postgres
     restart: unless-stopped
+    environment:
+      POSTGRES_USER: mes
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mes}
+      POSTGRES_DB: osat_mes
     ports:
-      - "27017:27017"
+      - "5432:5432"
     volumes:
-      - mongo-data:/data/db
+      - pg-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      test: ["CMD-SHELL", "pg_isready -U mes -d osat_mes"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -18,12 +22,11 @@ services:
     container_name: mes-api
     restart: unless-stopped
     depends_on:
-      mongo:
+      postgres:
         condition: service_healthy
     environment:
-      MES_DB_BACKEND: mongo
-      MES_MONGODB_URL: mongodb://mongo:27017
-      MES_MONGODB_DB: osat_mes
+      MES_DB_BACKEND: postgres
+      MES_DATABASE_URL: postgresql://mes:${POSTGRES_PASSWORD:-mes}@postgres:5432/osat_mes
       MES_JWT_SECRET: ${MES_JWT_SECRET:-please-change-me-in-production}
       MES_FACTORY_CODE: OSAT-KH1
       MES_TZ_OFFSET_HOURS: "8"
@@ -31,4 +34,4 @@ services:
       - "8000:8000"
 
 volumes:
-  mongo-data:
+  pg-data:

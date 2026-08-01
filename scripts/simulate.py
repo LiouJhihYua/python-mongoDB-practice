@@ -19,18 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.database import (  # noqa: E402
-    COL_DEVICES,
-    COL_EQUIPMENTS,
-    COL_LOTS,
-    COL_MEASUREMENT_ITEMS,
-    COL_OPERATIONS,
-    COL_TOOLS,
-    COL_USERS,
-    COL_WAFERS,
-    COL_WORK_ORDERS,
-    connect_db,
-)
+from app.database import connect_db  # noqa: E402
+from app.database import fetch_one  # noqa: E402
 from app.errors import MESError  # noqa: E402
 from app.models import base as base_models  # noqa: E402
 from app.models.enums import (  # noqa: E402
@@ -77,6 +67,8 @@ FT_BIN = {"FT-OPEN": 2, "FT-SHORT": 3, "FT-FUNC": 4, "FT-LEAK": 5, "FT-SPEED": 6
 TOOL_PREFIX_BY_OP = {"WFR_SAW": "BLD", "DIE_ATTACH": "CLT", "WIRE_BOND": "CAP", "FT": "SKT"}
 #: 每次進站有多少機率做一次 SPC 量測
 MEASURE_PROBABILITY = 1.0
+#: 在製中的批號狀態
+ACTIVE_STATUSES = [LotStatus.WAITING.value, LotStatus.RUNNING.value, LotStatus.HOLD.value]
 
 
 class SimClock:
@@ -93,8 +85,8 @@ class SimClock:
 
 
 async def _users(db) -> dict[str, dict]:
-    rows = await db[COL_USERS].find({}).to_list(length=None)
-    return {u["username"]: u for u in rows}
+    rows = await db.fetch("SELECT * FROM users")
+    return {u["username"]: dict(u) for u in rows}
 
 
 def _pick_operator(users: dict[str, dict], op_code: str, rng: random.Random) -> dict:
@@ -103,15 +95,15 @@ def _pick_operator(users: dict[str, dict], op_code: str, rng: random.Random) -> 
 
 
 async def _free_equipment(db, op_code: str, rng: random.Random) -> dict | None:
-    rows = await db[COL_EQUIPMENTS].find(
-        {
-            "op_codes": op_code,
-            "active": True,
-            "current_lot_id": None,
-            "current_state": {"$in": [EquipmentState.STANDBY.value, EquipmentState.PRODUCTIVE.value]},
-        }
-    ).to_list(length=None)
-    return rng.choice(rows) if rows else None
+    rows = await db.fetch(
+        """
+        SELECT * FROM equipments
+        WHERE $1 = ANY(op_codes) AND active AND current_lot_id IS NULL
+          AND current_state = ANY($2::text[])
+        """,
+        op_code, [EquipmentState.STANDBY.value, EquipmentState.PRODUCTIVE.value],
+    )
+    return dict(rng.choice(rows)) if rows else None
 
 
 def _split_rejects(reject: int, codes: list[str], rng: random.Random) -> list[dict]:
@@ -131,7 +123,7 @@ def _split_rejects(reject: int, codes: list[str], rng: random.Random) -> list[di
 
 
 async def _create_work_orders(db, rng: random.Random, clock: SimClock, count: int) -> list[str]:
-    devices = await db[COL_DEVICES].find({"active": True}).to_list(length=None)
+    devices = [dict(r) for r in await db.fetch("SELECT * FROM devices WHERE active")]
     wo_nos = []
     for _ in range(count):
         device = rng.choice(devices)
@@ -159,15 +151,17 @@ async def _spare_tool(db, op_code: str, rng: random.Random) -> dict | None:
     prefix = TOOL_PREFIX_BY_OP.get(op_code)
     if not prefix:
         return None
-    spare = await db[COL_TOOLS].find_one(
-        {"op_codes": op_code, "status": ToolStatus.IDLE.value, "active": True}
+    spare = await db.fetchrow(
+        "SELECT * FROM tools WHERE $1 = ANY(op_codes) AND status = $2 AND active LIMIT 1",
+        op_code, ToolStatus.IDLE.value,
     )
     if spare:
-        return spare
-    template = await db[COL_TOOLS].find_one({"op_codes": op_code})
-    if template is None:
+        return dict(spare)
+    template_row = await db.fetchrow("SELECT * FROM tools WHERE $1 = ANY(op_codes) LIMIT 1", op_code)
+    if template_row is None:
         return None
-    existing = await db[COL_TOOLS].count_documents({"op_codes": op_code})
+    template = dict(template_row)
+    existing = await db.fetchval("SELECT count(*) FROM tools WHERE $1 = ANY(op_codes)", op_code)
     try:
         await tool_service.create_tool(
             db,
@@ -179,16 +173,20 @@ async def _spare_tool(db, op_code: str, rng: random.Random) -> dict | None:
         )
     except MESError:
         return None
-    return await db[COL_TOOLS].find_one({"tool_id": f"{prefix}-{existing + 1:03d}"})
+    return await fetch_one(db, "SELECT * FROM tools WHERE tool_id = $1", f"{prefix}-{existing + 1:03d}")
 
 
 async def _mount_initial_tools(db, rng: random.Random) -> int:
     """開線：每台需要治具的機台各裝一支。"""
     mounted = 0
     for op_code in TOOL_PREFIX_BY_OP:
-        equipments = await db[COL_EQUIPMENTS].find({"op_codes": op_code, "active": True}).to_list(length=None)
+        equipments = await db.fetch(
+            "SELECT * FROM equipments WHERE $1 = ANY(op_codes) AND active", op_code
+        )
         for eq in equipments:
-            if await db[COL_TOOLS].find_one({"eq_id": eq["eq_id"], "status": ToolStatus.MOUNTED.value}):
+            if await db.fetchval(
+                "SELECT 1 FROM tools WHERE eq_id = $1 AND status = $2", eq["eq_id"], ToolStatus.MOUNTED.value
+            ):
                 continue
             spare = await _spare_tool(db, op_code, rng)
             if spare is None:
@@ -235,9 +233,9 @@ def _sample_values(item: dict, rng: random.Random, drift: float) -> list[float]:
 async def _record_measurements(
     db, lot: dict, users: dict, rng: random.Random, drift: dict[tuple, float]
 ) -> int:
-    items = await db[COL_MEASUREMENT_ITEMS].find(
-        {"op_code": lot["current_op"], "active": True}
-    ).to_list(length=None)
+    items = await db.fetch(
+        "SELECT * FROM measurement_items WHERE op_code = $1 AND active", lot["current_op"]
+    )
     recorded = 0
     for item in items:
         if rng.random() > MEASURE_PROBABILITY:
@@ -261,20 +259,24 @@ async def _record_measurements(
 
 async def _openable_work_orders(db) -> list[str]:
     """尚有剩餘可投料量的工單。"""
-    rows = await db[COL_WORK_ORDERS].find(
-        {"status": {"$in": [WorkOrderStatus.RELEASED.value, WorkOrderStatus.IN_PROGRESS.value]}}
-    ).to_list(length=None)
-    return [r["wo_no"] for r in rows if int(r["plan_qty"]) > int(r.get("released_qty", 0))]
+    rows = await db.fetch(
+        """
+        SELECT wo_no FROM work_orders
+        WHERE status = ANY($1::text[]) AND plan_qty > released_qty
+        """,
+        [WorkOrderStatus.RELEASED.value, WorkOrderStatus.IN_PROGRESS.value],
+    )
+    return [r["wo_no"] for r in rows]
 
 
 async def _replenish_wafers(db, device_id: str, need: int, rng: random.Random) -> None:
     """晶圓不足時模擬新的晶圓進料（每卡匣 25 片）。"""
-    device = await db[COL_DEVICES].find_one({"device_id": device_id})
+    device = await fetch_one(db, "SELECT * FROM devices WHERE device_id = $1", device_id)
     prefix = device_id.split("-")[0]
-    while await db[COL_WAFERS].count_documents(
-        {"device_id": device_id, "consumed": {"$ne": True}}
+    while await db.fetchval(
+        "SELECT count(*) FROM wafers WHERE device_id = $1 AND NOT consumed", device_id
     ) < need:
-        existing = await db[COL_WAFERS].count_documents({"device_id": device_id})
+        existing = await db.fetchval("SELECT count(*) FROM wafers WHERE device_id = $1", device_id)
         wafer_lot = f"W{prefix}{existing // 25 + 1:03d}"
         for slot in range(1, 26):
             cp_yield = rng.uniform(0.93, 0.995)
@@ -303,9 +305,10 @@ async def _open_lot(db, wo_no: str, rng: random.Random) -> dict | None:
         return None
     qty = min(remaining, rng.choice([12, 25, 25]))
     await _replenish_wafers(db, wo["device_id"], qty, rng)
-    wafers = await db[COL_WAFERS].find(
-        {"device_id": wo["device_id"], "consumed": {"$ne": True}}
-    ).limit(qty).to_list(length=qty)
+    wafers = await db.fetch(
+        "SELECT wafer_id FROM wafers WHERE device_id = $1 AND NOT consumed ORDER BY wafer_id LIMIT $2",
+        wo["device_id"], qty,
+    )
     if len(wafers) < qty:
         return None
     try:
@@ -325,8 +328,8 @@ async def _open_lot(db, wo_no: str, rng: random.Random) -> dict | None:
 
 
 async def _do_track_out(db, lot: dict, users: dict, rng: random.Random) -> dict:
-    operation = await db[COL_OPERATIONS].find_one({"op_code": lot["current_op"]})
-    device = await db[COL_DEVICES].find_one({"device_id": lot["device_id"]})
+    operation = await fetch_one(db, "SELECT * FROM operations WHERE op_code = $1", lot["current_op"])
+    device = await fetch_one(db, "SELECT * FROM devices WHERE device_id = $1", lot["device_id"])
     op_code = operation["op_code"]
     expected, _unit = lot_service.compute_expected_output(
         int(lot["qty"]), operation, device, lot["unit_type"]
@@ -373,10 +376,15 @@ async def _do_track_out(db, lot: dict, users: dict, rng: random.Random) -> dict:
 
 
 async def simulate(days: int = 3, seed: int = 20250801) -> None:
-    rng = random.Random(seed)
-    db = await connect_db()
+    pool = await connect_db()
+    async with pool.acquire() as db:
+        await _simulate(db, days, seed)
 
-    if await db[COL_OPERATIONS].count_documents({}) == 0:
+
+async def _simulate(db, days: int, seed: int) -> None:
+    rng = random.Random(seed)
+
+    if await db.fetchval("SELECT count(*) FROM operations") == 0:
         log.error("尚未建立主檔，請先執行：python -m scripts.seed")
         return
 
@@ -388,8 +396,8 @@ async def simulate(days: int = 3, seed: int = 20250801) -> None:
     end = datetime.now(timezone.utc)
     clock = SimClock(end - timedelta(days=days))
     # 種子晶圓是以「現在」建檔的，往前拉到模擬起點之前，避免出現「投入早於進料」
-    await db[COL_WAFERS].update_many(
-        {"consumed": {"$ne": True}}, {"$set": {"received_at": clock.now - timedelta(days=1)}}
+    await db.execute(
+        "UPDATE wafers SET received_at = $1 WHERE NOT consumed", clock.now - timedelta(days=1)
     )
     base_models.set_clock(clock)
     try:
@@ -416,8 +424,8 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
 
         # 1) 維持目標在製水位，不足就投新料
         if ticks % 3 == 0:
-            active = await db[COL_LOTS].count_documents(
-                {"status": {"$in": [LotStatus.WAITING.value, LotStatus.RUNNING.value, LotStatus.HOLD.value]}}
+            active = await db.fetchval(
+                "SELECT count(*) FROM lots WHERE status = ANY($1::text[])", ACTIVE_STATUSES
             )
             if active < TARGET_WIP_LOTS:
                 openable = await _openable_work_orders(db)
@@ -426,10 +434,12 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
                         break
 
         # 2) 加工完成的批號出站
-        running = await db[COL_LOTS].find({"status": LotStatus.RUNNING.value}).to_list(length=None)
+        running = [dict(r) for r in await db.fetch(
+            "SELECT * FROM lots WHERE status = $1", LotStatus.RUNNING.value
+        )]
         for lot in running:
-            operation = await db[COL_OPERATIONS].find_one({"op_code": lot["current_op"]})
-            std = float(operation.get("standard_cycle_time_sec") or 600)
+            operation = await fetch_one(db, "SELECT * FROM operations WHERE op_code = $1", lot["current_op"])
+            std = float(operation["standard_cycle_time_sec"] or 600)
             elapsed = (clock.now - base_models.ensure_aware(lot["track_in_at"])).total_seconds()
             if elapsed >= std * rng.uniform(0.85, 1.3):
                 try:
@@ -443,13 +453,14 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
                     log.debug("出站失敗 %s：%s", lot["lot_id"], exc)
 
         # 3) 待進站的批號找機台上線（依優先序）
-        waiting = await db[COL_LOTS].find({"status": LotStatus.WAITING.value}).sort(
-            [("priority", 1), ("last_track_out_at", 1)]
-        ).to_list(length=None)
+        waiting = [dict(r) for r in await db.fetch(
+            "SELECT * FROM lots WHERE status = $1 ORDER BY priority, last_track_out_at NULLS FIRST",
+            LotStatus.WAITING.value,
+        )]
         for lot in waiting:
-            operation = await db[COL_OPERATIONS].find_one({"op_code": lot["current_op"]})
+            operation = await fetch_one(db, "SELECT * FROM operations WHERE op_code = $1", lot["current_op"])
             eq_id = ""
-            if operation.get("requires_equipment", True):
+            if operation["requires_equipment"]:
                 eq = await _free_equipment(db, lot["current_op"], rng)
                 if eq is None:
                     continue  # 沒機台 → 排隊，Q-Time 開始累積
@@ -460,14 +471,16 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
                     db, {"lot_id": lot["lot_id"], "eq_id": eq_id, "remark": ""}, operator
                 )
                 stats["track_in"] += 1
-                running_lot = await db[COL_LOTS].find_one({"lot_id": lot["lot_id"]})
+                running_lot = await fetch_one(db, "SELECT * FROM lots WHERE lot_id = $1", lot["lot_id"])
                 stats["measured"] += await _record_measurements(db, running_lot, users, rng, drift)
             except MESError:
                 stats["holds"] += 1  # 多為 Q-Time 逾時自動扣留
 
         # 4) 品保處理扣留：兩小時後放行
         if ticks % 12 == 0:
-            held = await db[COL_LOTS].find({"status": LotStatus.HOLD.value}).to_list(length=None)
+            held = [dict(r) for r in await db.fetch(
+                "SELECT * FROM lots WHERE status = $1", LotStatus.HOLD.value
+            )]
             for lot in held:
                 if rng.random() < 0.6:
                     try:
@@ -487,9 +500,10 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
                 )
                 stats["downs"] += 1
         if rng.random() < 0.35:
-            down = await db[COL_EQUIPMENTS].find(
-                {"current_state": EquipmentState.UNSCHEDULED_DOWN.value}
-            ).to_list(length=None)
+            down = await db.fetch(
+                "SELECT * FROM equipments WHERE current_state = $1",
+                EquipmentState.UNSCHEDULED_DOWN.value,
+            )
             for eq in down:
                 if rng.random() < 0.4:
                     await equipment_service.set_state(
@@ -498,7 +512,7 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
 
         # 6) 完工批號出貨
         if ticks % 24 == 0:
-            done = await db[COL_LOTS].find({"status": LotStatus.COMPLETED.value}).to_list(length=None)
+            done = await db.fetch("SELECT * FROM lots WHERE status = $1", LotStatus.COMPLETED.value)
             by_customer: dict[str, list[str]] = {}
             for lot in done:
                 by_customer.setdefault(lot["customer_code"], []).append(lot["lot_id"])
@@ -520,8 +534,8 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
     # 收尾：示範拆批與併批，讓族譜追溯有東西可看
     await _demo_split_merge(db, users, stats)
 
-    wip = await db[COL_LOTS].count_documents(
-        {"status": {"$in": [LotStatus.WAITING.value, LotStatus.RUNNING.value, LotStatus.HOLD.value]}}
+    wip = await db.fetchval(
+        "SELECT count(*) FROM lots WHERE status = ANY($1::text[])", ACTIVE_STATUSES
     )
     log.info(
         "模擬完成：進站 %d / 出站 %d / 自動扣留 %d / 放行 %d / 設備異常 %d / 出貨 %d 批",
@@ -532,9 +546,9 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
 
 
 async def _demo_split_merge(db, users: dict, stats: dict) -> None:
-    waiting = await db[COL_LOTS].find(
-        {"status": LotStatus.WAITING.value, "qty": {"$gte": 4}}
-    ).to_list(length=None)
+    waiting = await db.fetch(
+        "SELECT * FROM lots WHERE status = $1 AND qty >= 4 ORDER BY lot_id", LotStatus.WAITING.value
+    )
     if not waiting:
         return
     lot = waiting[0]
@@ -550,15 +564,17 @@ async def _demo_split_merge(db, users: dict, stats: dict) -> None:
         log.debug("拆批略過：%s", exc)
 
     # 找兩個同料號同站的批號併批
-    pipeline = [
-        {"$match": {"status": LotStatus.WAITING.value}},
-        {"$group": {"_id": {"d": "$device_id", "s": "$current_seq", "u": "$unit_type"},
-                    "lots": {"$push": "$lot_id"}, "n": {"$sum": 1}}},
-        {"$match": {"n": {"$gte": 2}}},
-    ]
-    groups = await db[COL_LOTS].aggregate(pipeline).to_list(length=None)
+    groups = await db.fetch(
+        """
+        SELECT array_agg(lot_id ORDER BY lot_id) AS lots
+        FROM lots WHERE status = $1
+        GROUP BY device_id, current_seq, unit_type
+        HAVING count(*) >= 2
+        """,
+        LotStatus.WAITING.value,
+    )
     if groups:
-        lot_ids = groups[0]["lots"][:2]
+        lot_ids = list(groups[0]["lots"])[:2]
         try:
             merged = await lot_service.merge_lots(
                 db, {"lot_ids": lot_ids, "carrier_id": "", "reason": "湊滿載盤"}, users["planner01"]

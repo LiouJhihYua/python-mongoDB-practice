@@ -59,7 +59,7 @@ async def create_pm(db: DB, eq_id: str, pm_type: str, due_date: datetime, user: 
 
 
 @router.post("/pm/{pm_id}/complete", dependencies=[CanOperate], summary="完成 PM 保養")
-async def complete_pm(db: DB, pm_id: str, user: CurrentUser, remark: str = ""):
+async def complete_pm(db: DB, pm_id: int, user: CurrentUser, remark: str = ""):
     return await equipment_service.complete_pm(db, pm_id, user["username"], remark)
 
 

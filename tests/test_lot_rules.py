@@ -22,14 +22,14 @@ async def test_hold_blocks_track_in_and_release_restores(factory, users):
     with pytest.raises(StateError, match="扣留中"):
         await lot_service.track_in(db, {"lot_id": lot_id, "eq_id": ""}, users["op001"])
 
-    hold_doc = await db["holds"].find_one({"lot_id": lot_id, "status": "OPEN"})
+    hold_doc = await db.fetchrow("SELECT * FROM holds WHERE lot_id = $1 AND status = 'OPEN'", lot_id)
     assert hold_doc["reason"] == "QUALITY" and hold_doc["held_by"] == "qc01"
 
     released = await lot_service.release_lot(
         db, {"lot_id": lot_id, "remark": "確認無異常"}, users["qc01"]
     )
     assert released["status"] == LotStatus.WAITING.value
-    assert (await db["holds"].find_one({"lot_id": lot_id}))["status"] == "RELEASED"
+    assert (await db.fetchval("SELECT status FROM holds WHERE lot_id = $1", lot_id)) == "RELEASED"
 
 
 async def test_double_hold_rejected(factory, users):
@@ -39,7 +39,9 @@ async def test_double_hold_rejected(factory, users):
     with pytest.raises(StateError, match="狀態為 HOLD，不可扣留"):
         await lot_service.hold_lot(db, {"lot_id": lot["lot_id"], "reason": "QUALITY", "remark": ""}, users["qc01"])
     # 只會留下一筆未結案的扣留紀錄
-    assert await db["holds"].count_documents({"lot_id": lot["lot_id"], "status": "OPEN"}) == 1
+    assert await db.fetchval(
+        "SELECT count(*) FROM holds WHERE lot_id = $1 AND status = 'OPEN'", lot["lot_id"]
+    ) == 1
 
 
 async def test_release_without_hold_rejected(factory, users):
@@ -227,7 +229,7 @@ async def test_qtime_violation_auto_holds_then_waived_after_release(factory, use
     held = await lot_service.get_lot(db, lot_id, raw=True)
     assert held["status"] == LotStatus.HOLD.value
     assert held["qtime_violations"] == 1
-    hold_doc = await db["holds"].find_one({"lot_id": lot_id, "status": "OPEN"})
+    hold_doc = await db.fetchrow("SELECT * FROM holds WHERE lot_id = $1 AND status = 'OPEN'", lot_id)
     assert hold_doc["reason"] == "QTIME"
 
     # 放行後可以進站，不會再度被自動扣留（否則會形成死循環）
@@ -236,8 +238,9 @@ async def test_qtime_violation_auto_holds_then_waived_after_release(factory, use
     assert result["status"] == LotStatus.RUNNING.value
     assert result["qtime_waived_seq"] is None  # 特採用掉即失效
 
-    history = await db["lot_history"].find_one(
-        {"lot_id": lot_id, "op_code": "WIRE_BOND", "action": "TRACK_IN"}
+    history = await db.fetchrow(
+        "SELECT * FROM lot_history WHERE lot_id = $1 AND op_code = 'WIRE_BOND' AND action = 'TRACK_IN'",
+        lot_id,
     )
     assert history["qtime_violation"] is True
     assert history["queue_sec"] >= 3 * 3600
@@ -265,7 +268,9 @@ async def test_partial_scrap(factory, users):
     assert result["qty"] == 1500
     assert result["scrap_qty"] == 500
     assert result["status"] == LotStatus.WAITING.value
-    assert await db["defect_records"].count_documents({"lot_id": lot["lot_id"]}) == 1
+    assert await db.fetchval(
+        "SELECT count(*) FROM defect_records WHERE lot_id = $1", lot["lot_id"]
+    ) == 1
 
 
 async def test_scrap_more_than_on_hand_rejected(factory, users):

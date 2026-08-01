@@ -7,12 +7,7 @@ Q-Time 剩餘 → 急單優先序 → 交期 → 等待時間排出順序，並�
 
 from __future__ import annotations
 
-from app.database import (
-    COL_EQUIPMENTS,
-    COL_LOTS,
-    COL_OPERATIONS,
-    COL_WORK_ORDERS,
-)
+from app.database import T_EQUIPMENTS, T_LOTS, T_OPERATIONS, T_WORK_ORDERS, fetch_all
 from app.models.base import ensure_aware, utcnow
 from app.models.enums import LotStatus, RUNNABLE_EQUIPMENT_STATES
 
@@ -21,70 +16,67 @@ QTIME_URGENT_MINUTES = 60
 #: 排序時「沒有 Q-Time 管制」用的哨兵值
 NO_QTIME = 10**9
 
-
-async def _operation_map(db) -> dict[str, dict]:
-    rows = await db[COL_OPERATIONS].find({}).to_list(length=None)
-    return {r["op_code"]: r for r in rows}
+RUNNABLE_STATES = [s.value for s in RUNNABLE_EQUIPMENT_STATES]
 
 
 async def _free_equipment_map(db) -> dict[str, list[str]]:
     """各站別目前可接單的機台。"""
-    runnable = [s.value for s in RUNNABLE_EQUIPMENT_STATES]
-    rows = await db[COL_EQUIPMENTS].find(
-        {"active": True, "current_lot_id": None, "current_state": {"$in": runnable}}
-    ).to_list(length=None)
+    rows = await fetch_all(
+        db,
+        f"""
+        SELECT eq_id, op_codes FROM {T_EQUIPMENTS}
+        WHERE active AND current_lot_id IS NULL AND current_state = ANY($1::text[])
+        ORDER BY eq_id
+        """,
+        RUNNABLE_STATES,
+    )
     result: dict[str, list[str]] = {}
     for eq in rows:
-        for op_code in eq.get("op_codes") or []:
+        for op_code in eq["op_codes"] or []:
             result.setdefault(op_code, []).append(eq["eq_id"])
-    return {k: sorted(v) for k, v in result.items()}
-
-
-async def _due_date_map(db, wo_nos: list[str]) -> dict[str, object]:
-    if not wo_nos:
-        return {}
-    rows = await db[COL_WORK_ORDERS].find(
-        {"wo_no": {"$in": wo_nos}}, {"_id": 0, "wo_no": 1, "due_date": 1}
-    ).to_list(length=None)
-    return {r["wo_no"]: r.get("due_date") for r in rows}
+    return result
 
 
 async def dispatch_list(db, op_code: str | None = None, limit: int = 100) -> dict:
     """派工清單：待進站批號的建議加工順序。"""
     now = utcnow()
-    filt: dict = {"status": LotStatus.WAITING.value}
-    if op_code:
-        filt["current_op"] = op_code
-
-    lots = await db[COL_LOTS].find(filt).to_list(length=None)
-    operations = await _operation_map(db)
+    lots = await fetch_all(
+        db,
+        f"""
+        SELECT l.*, o.name AS op_name, o.max_queue_minutes, o.requires_equipment, w.due_date
+        FROM {T_LOTS} l
+        LEFT JOIN {T_OPERATIONS} o ON o.op_code = l.current_op
+        LEFT JOIN {T_WORK_ORDERS} w ON w.wo_no = l.wo_no
+        WHERE l.status = $1 AND ($2::text IS NULL OR l.current_op = $2)
+        """,
+        LotStatus.WAITING.value, op_code,
+    )
     free_equipment = await _free_equipment_map(db)
-    due_dates = await _due_date_map(db, sorted({l["wo_no"] for l in lots if l.get("wo_no")}))
 
     rows: list[dict] = []
     for lot in lots:
-        operation = operations.get(lot["current_op"], {})
-        waiting_min = (now - ensure_aware(lot.get("last_track_out_at") or lot["created_at"])).total_seconds() / 60
-        limit_min = int(operation.get("max_queue_minutes", 0) or 0)
+        waiting_min = (
+            now - ensure_aware(lot["last_track_out_at"] or lot["created_at"])
+        ).total_seconds() / 60
+        limit_min = int(lot["max_queue_minutes"] or 0)
         remaining = round(limit_min - waiting_min, 1) if limit_min else None
-
-        due = due_dates.get(lot.get("wo_no"))
+        due = lot["due_date"]
         days_to_due = round((ensure_aware(due) - now).total_seconds() / 86400, 2) if due else None
 
-        needs_eq = operation.get("requires_equipment", True)
+        needs_eq = lot["requires_equipment"] if lot["requires_equipment"] is not None else True
         available = free_equipment.get(lot["current_op"], []) if needs_eq else []
 
         rows.append({
             "lot_id": lot["lot_id"],
             "device_id": lot["device_id"],
-            "customer_code": lot.get("customer_code"),
-            "wo_no": lot.get("wo_no"),
+            "customer_code": lot["customer_code"],
+            "wo_no": lot["wo_no"],
             "seq": lot["current_seq"],
             "op_code": lot["current_op"],
-            "op_name": operation.get("name", ""),
+            "op_name": lot["op_name"] or "",
             "qty": lot["qty"],
             "unit_type": lot["unit_type"],
-            "priority": int(lot.get("priority", 5)),
+            "priority": int(lot["priority"]),
             "waiting_minutes": round(waiting_min, 1),
             "qtime_limit_min": limit_min or None,
             "qtime_remaining_min": remaining,
@@ -92,7 +84,7 @@ async def dispatch_list(db, op_code: str | None = None, limit: int = 100) -> dic
             "days_to_due": days_to_due,
             "available_equipments": available,
             "ready": (not needs_eq) or bool(available),
-            "carrier_id": lot.get("carrier_id", ""),
+            "carrier_id": lot["carrier_id"],
         })
 
     for row in rows:

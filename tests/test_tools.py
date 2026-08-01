@@ -74,7 +74,7 @@ async def test_usage_accumulates_on_track_out(factory, users):
 async def test_warning_before_expiry(factory, users):
     db = factory
     await tool_service.mount(db, "CAP-001", "WB-01", "eng01")
-    await db["tools"].update_one({"tool_id": "CAP-001"}, {"$set": {"used_count": 7500}})
+    await db.execute("UPDATE tools SET used_count = 7500 WHERE tool_id = 'CAP-001'")
     lot_id = await _lot_running_at_wire_bond(db, users, qty=1)
     result = await _track_out_all(db, users, lot_id)
 
@@ -83,14 +83,14 @@ async def test_warning_before_expiry(factory, users):
     assert alert["expired"] is False
     assert alert["usage_ratio"] == pytest.approx(0.85)
     assert "請準備更換" in alert["message"]
-    eq = await db["equipments"].find_one({"eq_id": "WB-01"})
+    eq = await db.fetchrow("SELECT * FROM equipments WHERE eq_id = 'WB-01'")
     assert eq["current_state"] == EquipmentState.STANDBY.value  # 尚未停機
 
 
 async def test_expiry_stops_equipment(factory, users):
     db = factory
     await tool_service.mount(db, "CAP-001", "WB-01", "eng01")
-    await db["tools"].update_one({"tool_id": "CAP-001"}, {"$set": {"used_count": 9500}})
+    await db.execute("UPDATE tools SET used_count = 9500 WHERE tool_id = 'CAP-001'")
     lot_id = await _lot_running_at_wire_bond(db, users, qty=1)
     result = await _track_out_all(db, users, lot_id)
 
@@ -102,7 +102,7 @@ async def test_expiry_stops_equipment(factory, users):
     assert tool["status"] == ToolStatus.EXPIRED.value
     assert tool["used_count"] == 10500
 
-    eq = await db["equipments"].find_one({"eq_id": "WB-01"})
+    eq = await db.fetchrow("SELECT * FROM equipments WHERE eq_id = 'WB-01'")
     assert eq["current_state"] == EquipmentState.SCHEDULED_DOWN.value
     assert eq["state_reason"] == "TOOL_EXPIRED"
     assert "CAP-001" in eq["state_remark"]
@@ -112,7 +112,7 @@ async def test_expired_equipment_blocks_track_in(factory, users):
     """超壽命的機台不該再接料。"""
     db = factory
     await tool_service.mount(db, "CAP-001", "WB-01", "eng01")
-    await db["tools"].update_one({"tool_id": "CAP-001"}, {"$set": {"used_count": 9999}})
+    await db.execute("UPDATE tools SET used_count = 9999 WHERE tool_id = 'CAP-001'")
     lot_id = await _lot_running_at_wire_bond(db, users, qty=1)
     await _track_out_all(db, users, lot_id)
 
@@ -125,7 +125,7 @@ async def test_expired_equipment_blocks_track_in(factory, users):
 async def test_replace_expired_tool_restores_equipment(factory, users):
     db = factory
     await tool_service.mount(db, "CAP-001", "WB-01", "eng01")
-    await db["tools"].update_one({"tool_id": "CAP-001"}, {"$set": {"used_count": 9999}})
+    await db.execute("UPDATE tools SET used_count = 9999 WHERE tool_id = 'CAP-001'")
     lot_id = await _lot_running_at_wire_bond(db, users, qty=1)
     await _track_out_all(db, users, lot_id)
 
@@ -138,14 +138,14 @@ async def test_replace_expired_tool_restores_equipment(factory, users):
     assert old["status"] == ToolStatus.SCRAPPED.value  # 到期治具直接報廢，不會被誤用
     assert old["eq_id"] is None
 
-    eq = await db["equipments"].find_one({"eq_id": "WB-01"})
+    eq = await db.fetchrow("SELECT * FROM equipments WHERE eq_id = 'WB-01'")
     assert eq["current_state"] == EquipmentState.STANDBY.value
 
 
 async def test_expired_tool_cannot_be_remounted(factory):
     db = factory
-    await db["tools"].update_one(
-        {"tool_id": "CAP-001"}, {"$set": {"status": ToolStatus.EXPIRED.value}}
+    await db.execute(
+        "UPDATE tools SET status = $1 WHERE tool_id = 'CAP-001'", ToolStatus.EXPIRED.value
     )
     with pytest.raises(StateError, match="不可上機"):
         await tool_service.mount(db, "CAP-001", "WB-01", "eng01")
@@ -154,7 +154,7 @@ async def test_expired_tool_cannot_be_remounted(factory):
 async def test_attention_list(factory, users):
     db = factory
     await tool_service.mount(db, "CAP-001", "WB-01", "eng01")
-    await db["tools"].update_one({"tool_id": "CAP-001"}, {"$set": {"used_count": 9000}})
+    await db.execute("UPDATE tools SET used_count = 9000 WHERE tool_id = 'CAP-001'")
     watch = await tool_service.attention_list(db)
     assert [t["tool_id"] for t in watch] == ["CAP-001"]
     assert watch[0]["usage_ratio"] == pytest.approx(0.9)

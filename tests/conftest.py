@@ -1,13 +1,22 @@
-"""測試共用設定：一律使用記憶體資料庫，每個測試取得乾淨的一份。"""
+"""測試共用設定。
+
+資料庫來源：
+* 有設定 ``MES_TEST_DATABASE_URL`` 時直接用它（CI 上接一台 PostgreSQL 最快）
+* 否則以 pgserver 就地啟動一個內嵌 PostgreSQL，不必事先安裝任何東西
+
+每個測試開始前會清空所有資料表，彼此不互相影響。
+"""
 
 import os
 
 # 必須早於 app.config 匯入
-os.environ["MES_DB_BACKEND"] = "memory"
-os.environ["MES_JWT_SECRET"] = "test-secret"
-os.environ["MES_TZ_OFFSET_HOURS"] = "8"
+os.environ.setdefault("MES_JWT_SECRET", "test-secret")
+os.environ.setdefault("MES_TZ_OFFSET_HOURS", "8")
+os.environ["MES_DB_BACKEND"] = "postgres"
 
+import tempfile  # noqa: E402
 from datetime import datetime, timedelta, timezone  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
@@ -105,15 +114,40 @@ USERS = [
 
 GROSS_DIE = 1000
 
+_embedded_server = None
+
+
+def _test_dsn() -> str:
+    """優先用環境變數指定的資料庫，否則就地啟一個內嵌 PostgreSQL。"""
+    global _embedded_server
+    dsn = os.environ.get("MES_TEST_DATABASE_URL")
+    if dsn:
+        return dsn
+
+    import pgserver
+
+    data_dir = Path(tempfile.mkdtemp(prefix="mes-test-pg-"))
+    _embedded_server = pgserver.get_server(data_dir)
+    return _embedded_server.get_uri()
+
+
+@pytest_asyncio.fixture(scope="session")
+async def pool():
+    """整個測試階段共用一個連線池。"""
+    created = await database.connect_db(_test_dsn(), force=True)
+    yield created
+    await database.close_db()
+    if _embedded_server is not None:
+        _embedded_server.cleanup()
+
 
 @pytest_asyncio.fixture
-async def db():
-    """每個測試一份全新的記憶體資料庫。"""
-    database._state.db = None
-    handle = await database.connect_db(force=True)
-    yield handle
+async def db(pool):
+    """每個測試都拿到一份清空過的資料庫。"""
+    async with pool.acquire() as conn:
+        await database.truncate_all(conn)
+        yield conn
     base_models.set_clock(None)
-    database._state.db = None
 
 
 @pytest_asyncio.fixture
@@ -192,28 +226,33 @@ async def factory(db):
 @pytest_asyncio.fixture
 async def users(factory):
     """以 username 取得使用者文件，供服務層直接呼叫。"""
-    rows = await factory[database.COL_USERS].find({}).to_list(length=None)
-    return {u["username"]: u for u in rows}
+    rows = await factory.fetch(f"SELECT * FROM {database.T_USERS}")
+    return {u["username"]: dict(u) for u in rows}
 
 
-@pytest.fixture
-def client(factory):
-    """已完成初始化的 API 測試用戶端（沿用 factory 建立的資料庫）。"""
-    from fastapi.testclient import TestClient
+@pytest_asyncio.fixture
+async def client(factory):
+    """API 測試用戶端。
+
+    使用 httpx 的 ASGI 傳輸直接在同一個事件迴圈跑應用程式；
+    TestClient 會另開一條執行緒與事件迴圈，那樣就無法共用 asyncpg 連線池。
+    """
+    import httpx
 
     from app.main import app
 
-    with TestClient(app) as test_client:
-        yield test_client
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        yield async_client
 
 
-@pytest.fixture
-def token(client):
-    """回傳依帳號取 Bearer 標頭的函式。"""
+@pytest_asyncio.fixture
+async def token(client):
+    """回傳依帳號取 Bearer 標頭的函式（需 await）。"""
 
-    def _headers(username: str = "admin", password: str | None = None) -> dict:
+    async def _headers(username: str = "admin", password: str | None = None) -> dict:
         password = password or ("admin1234" if username == "admin" else f"{username}1234")
-        res = client.post("/api/auth/login", json={"username": username, "password": password})
+        res = await client.post("/api/auth/login", json={"username": username, "password": password})
         assert res.status_code == 200, res.text
         return {"Authorization": f"Bearer {res.json()['access_token']}"}
 

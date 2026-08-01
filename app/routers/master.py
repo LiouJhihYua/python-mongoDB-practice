@@ -110,9 +110,7 @@ async def list_routes(db: DB, active: bool | None = None, skip: int = 0, limit: 
 
 @router.get("/routes/{route_code}", dependencies=[CanRead], summary="流程明細（預設取最新啟用版本）")
 async def get_route(db: DB, route_code: str, version: int | None = None):
-    from app.models.base import clean
-
-    return clean(await master_service.get_active_route(db, route_code, version))
+    return await master_service.get_active_route(db, route_code, version)
 
 
 # ── 不良代碼 ────────────────────────────────────────────────

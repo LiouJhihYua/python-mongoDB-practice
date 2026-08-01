@@ -60,5 +60,5 @@ async def bins(db: DB, window: Window, op_code: str | None = None, device_id: st
 
 
 @router.post("/defects/{record_id}/disposition", dependencies=[CanQC], summary="不良品判定")
-async def disposition(db: DB, record_id: str, disposition: DispositionType, user: CurrentUser, remark: str = ""):
+async def disposition(db: DB, record_id: int, disposition: DispositionType, user: CurrentUser, remark: str = ""):
     return await quality_service.disposition_defect(db, record_id, disposition.value, user["username"], remark)

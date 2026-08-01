@@ -41,7 +41,7 @@ async def test_qtime_urgency_jumps_the_queue(factory, users, clock):
     wo_no = await make_work_order(db, plan_qty=50)
 
     rush = await make_lot(db, qty=1, wo_no=wo_no)
-    await db["lots"].update_one({"lot_id": rush["lot_id"]}, {"$set": {"priority": 1}})
+    await db.execute("UPDATE lots SET priority = 1 WHERE lot_id = $1", rush["lot_id"])
 
     qtime_lot = await make_lot(db, qty=1, wo_no=wo_no)
     await advance_to(db, users, qtime_lot["lot_id"], "WIRE_BOND")  # 該站 Q-Time 60 分
@@ -133,18 +133,18 @@ async def test_master_data_changes_are_audited(factory):
     await master_service.customers.update(db, "MTK", {"name": "聯發科技"}, "eng01")
     rows = await audit_service.list_audit(db, kind="DATA", actor="eng01")
     assert rows[0]["action"] == "UPDATE"
-    assert rows[0]["collection"] == "customers"
+    assert rows[0]["table_name"] == "customers"
     assert rows[0]["key"] == "MTK"
     assert "name" in rows[0]["fields"]
 
 
 async def test_api_calls_are_audited(client, token):
-    planner = token("planner01")
-    client.post("/api/work-orders", headers=planner, json={
+    planner = await token("planner01")
+    await client.post("/api/work-orders", headers=planner, json={
         "device_id": "TEST-QFN48", "plan_qty": 5, "unit_type": "WAFER",
         "due_date": "2030-01-01T00:00:00Z",
     })
-    rows = client.get("/api/audit?kind=API", headers=token("admin")).json()
+    rows = (await client.get("/api/audit?kind=API", headers=await token("admin"))).json()
     entry = next(r for r in rows if r["path"] == "/api/work-orders")
     assert entry["method"] == "POST"
     assert entry["actor"] == "planner01"
@@ -155,14 +155,14 @@ async def test_api_calls_are_audited(client, token):
 
 async def test_login_is_not_audited(client, token):
     """登入請求帶密碼，不進稽核軌跡。"""
-    token("planner01")
-    rows = client.get("/api/audit", headers=token("admin")).json()
+    await token("planner01")
+    rows = (await client.get("/api/audit", headers=await token("admin"))).json()
     assert all(r.get("path") != "/api/auth/login" for r in rows)
 
 
 async def test_audit_requires_privilege(client, token):
-    assert client.get("/api/audit", headers=token("op001")).status_code == 403
-    assert client.get("/api/audit", headers=token("qc01")).status_code == 200
+    assert (await client.get("/api/audit", headers=await token("op001"))).status_code == 403
+    assert (await client.get("/api/audit", headers=await token("qc01"))).status_code == 200
 
 
 # ── 交接班 ──────────────────────────────────────────────────

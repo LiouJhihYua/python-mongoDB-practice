@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.database import connect_db, get_db  # noqa: E402
+from app.database import connect_db, truncate_all  # noqa: E402
 from app.errors import DuplicateError  # noqa: E402
 from app.models.enums import (  # noqa: E402
     DefectCategory,
@@ -215,10 +215,14 @@ async def _try(coro, label: str) -> bool:
 
 
 async def seed(reset: bool = False) -> None:
-    db = await connect_db()
+    pool = await connect_db()
+    async with pool.acquire() as db:
+        await _seed(db, reset)
+
+
+async def _seed(db, reset: bool) -> None:
     if reset:
-        for name in await db.list_collection_names():
-            await db[name].delete_many({})
+        await truncate_all(db)
         log.info("已清空資料庫")
 
     await user_service.ensure_bootstrap_admin(db)

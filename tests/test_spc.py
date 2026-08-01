@@ -51,7 +51,7 @@ async def test_out_of_spec_flags_and_holds_lot(factory, users):
 
     lot = await lot_service.get_lot(db, lot_id, raw=True)
     assert lot["status"] == LotStatus.HOLD.value
-    hold = await db["holds"].find_one({"lot_id": lot_id, "status": "OPEN"})
+    hold = await db.fetchrow("SELECT * FROM holds WHERE lot_id = $1 AND status = 'OPEN'", lot_id)
     assert "SPC 異常" in hold["remark"]
 
 
@@ -90,7 +90,7 @@ async def test_held_lot_can_still_track_out(factory, users):
     assert result["status"] == LotStatus.HOLD.value
     assert result["current_op"] == "FT"
     assert result["eq_id"] is None
-    eq = await db["equipments"].find_one({"eq_id": "WB-01"})
+    eq = await db.fetchrow("SELECT * FROM equipments WHERE eq_id = 'WB-01'")
     assert eq["current_lot_id"] is None
 
     # 放行後回到待進站
@@ -244,7 +244,7 @@ async def test_capability_two_sided(factory, users, clock):
 async def test_capability_one_sided_spec(factory, users, clock):
     """只有單邊規格時 Cp 無意義，但 Cpk 仍可算。"""
     db = factory
-    await db["measurement_items"].update_one({"item_code": "WB-PULL"}, {"$set": {"usl": None, "target": None}})
+    await db.execute("UPDATE measurement_items SET usl = NULL, target = NULL WHERE item_code = 'WB-PULL'")
     lot_id = await _lot_at_wire_bond(db, users)
     for _ in range(6):
         clock.advance(minutes=1)
@@ -305,7 +305,7 @@ async def test_item_spec_validation(factory):
 
 async def test_inactive_item_rejected(factory, users):
     db = factory
-    await db["measurement_items"].update_one({"item_code": "WB-PULL"}, {"$set": {"active": False}})
+    await db.execute("UPDATE measurement_items SET active = FALSE WHERE item_code = 'WB-PULL'")
     lot_id = await _lot_at_wire_bond(db, users)
     with pytest.raises(StateError, match="已停用"):
         await _measure(db, users, lot_id, [7.0] * 5)

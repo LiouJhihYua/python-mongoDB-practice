@@ -8,13 +8,13 @@ import hmac
 import json
 import secrets
 from datetime import timedelta
-from typing import Annotated, Iterable
+from typing import Annotated, Any, Iterable
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
 from app.config import settings
-from app.database import COL_USERS, get_db
+from app.database import T_USERS, get_db
 from app.models.base import utcnow
 from app.models.enums import Role
 
@@ -91,13 +91,17 @@ def _credentials_error(msg: str) -> HTTPException:
 
 
 # ── FastAPI 相依 ────────────────────────────────────────────
-async def get_current_user(token: Annotated[str | None, Depends(oauth2_scheme)]) -> dict:
+async def get_current_user(
+    token: Annotated[str | None, Depends(oauth2_scheme)],
+    db: Annotated[Any, Depends(get_db)],
+) -> dict:
     if not token:
         raise _credentials_error("需要登入")
     data = decode_access_token(token)
-    user = await get_db()[COL_USERS].find_one({"username": data["sub"]})
-    if user is None:
+    row = await db.fetchrow(f"SELECT * FROM {T_USERS} WHERE username = $1", data["sub"])
+    if row is None:
         raise _credentials_error("使用者不存在")
+    user = dict(row)
     if not user.get("active", True):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "帳號已停用")
     return user

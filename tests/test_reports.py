@@ -177,8 +177,8 @@ async def test_cycle_time_and_queue(factory, users, clock):
     await lot_service.track_in(db, {"lot_id": lot_id, "eq_id": "DS-01"}, users["op001"])
     clock.advance(minutes=40)  # 加工 40 分鐘
     current = await lot_service.get_lot(db, lot_id, raw=True)
-    device = await db["devices"].find_one({"device_id": current["device_id"]})
-    operation = await db["operations"].find_one({"op_code": "WFR_SAW"})
+    device = await db.fetchrow("SELECT * FROM devices WHERE device_id = $1", current["device_id"])
+    operation = await db.fetchrow("SELECT * FROM operations WHERE op_code = 'WFR_SAW'")
     expected, _ = lot_service.compute_expected_output(
         int(current["qty"]), operation, device, current["unit_type"]
     )

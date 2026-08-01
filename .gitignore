@@ -11,5 +11,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
-data/mongo/
+data/
+*.pgdata/
 *.log

@@ -31,7 +31,9 @@ async def make_lot(db, qty: int = 5, wo_no: str | None = None, with_wafers: bool
     wo_no = wo_no or await make_work_order(db)
     wafer_ids = []
     if with_wafers:
-        wafers = await db["wafers"].find({"consumed": {"$ne": True}}).limit(qty).to_list(length=qty)
+        wafers = await db.fetch(
+            "SELECT wafer_id FROM wafers WHERE NOT consumed ORDER BY wafer_id LIMIT $1", qty
+        )
         wafer_ids = [w["wafer_id"] for w in wafers]
     return await lot_service.create_lot(
         db,
@@ -45,10 +47,8 @@ async def run_step(db, users, lot_id: str, eq_id: str = "", reject: int = 0, def
     operator = users["op001"]
     await lot_service.track_in(db, {"lot_id": lot_id, "eq_id": eq_id, "remark": ""}, operator)
     lot = await lot_service.get_lot(db, lot_id, raw=True)
-    from app.services.master_service import operations
-
-    operation = await operations.raw(db, lot["current_op"])
-    device = await db["devices"].find_one({"device_id": lot["device_id"]})
+    operation = await db.fetchrow("SELECT * FROM operations WHERE op_code = $1", lot["current_op"])
+    device = await db.fetchrow("SELECT * FROM devices WHERE device_id = $1", lot["device_id"])
     expected, _ = lot_service.compute_expected_output(
         int(lot["qty"]), operation, device, lot["unit_type"]
     )

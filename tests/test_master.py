@@ -105,7 +105,7 @@ async def test_route_versioning_picks_latest(factory):
 
 async def test_inactive_route_not_selected(factory):
     db = factory
-    await db["routes"].update_one({"route_code": "RT-TEST", "version": 1}, {"$set": {"active": False}})
+    await db.execute("UPDATE routes SET active = FALSE WHERE route_code = 'RT-TEST' AND version = 1")
     with pytest.raises(NotFoundError):
         await master_service.get_active_route(db, "RT-TEST")
 

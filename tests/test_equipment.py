@@ -4,7 +4,6 @@ from datetime import timedelta
 
 import pytest
 
-from app.database import COL_EQUIPMENT_LOGS, COL_LOT_HISTORY
 from app.errors import ValidationError
 from app.models.base import ensure_aware
 from app.models.enums import EquipmentState, PMStatus
@@ -18,7 +17,9 @@ async def test_state_transition_closes_previous_log(factory, clock):
     clock.advance(hours=2)
     await equipment_service.set_state(db, "WB-01", EquipmentState.UNSCHEDULED_DOWN, "eng01", "EQ-ALARM")
 
-    logs = await db[COL_EQUIPMENT_LOGS].find({"eq_id": "WB-01"}).sort([("start_time", 1)]).to_list(length=None)
+    logs = await db.fetch(
+        "SELECT * FROM equipment_state_logs WHERE eq_id = 'WB-01' ORDER BY start_time, id"
+    )
     productive = [log for log in logs if log["state"] == EquipmentState.PRODUCTIVE.value][-1]
     assert productive["end_time"] is not None
     assert productive["duration_sec"] == pytest.approx(7200, abs=1)
@@ -26,7 +27,7 @@ async def test_state_transition_closes_previous_log(factory, clock):
     open_log = [log for log in logs if log["end_time"] is None]
     assert len(open_log) == 1 and open_log[0]["state"] == EquipmentState.UNSCHEDULED_DOWN.value
 
-    eq = await db["equipments"].find_one({"eq_id": "WB-01"})
+    eq = await db.fetchrow("SELECT * FROM equipments WHERE eq_id = 'WB-01'")
     assert eq["current_state"] == EquipmentState.UNSCHEDULED_DOWN.value
     assert ensure_aware(eq["state_since"]) >= start
 
@@ -45,12 +46,10 @@ async def test_oee_math(factory, clock):
     end = clock.now
 
     # 該設備在區間內出站 6,200 顆（良品 6,000）
-    await db[COL_LOT_HISTORY].insert_one(
-        {
-            "lot_id": "LX", "eq_id": "FT-01", "action": "TRACK_OUT",
-            "timestamp": start + timedelta(hours=1),
-            "qty_good": 6000, "qty_reject": 200, "process_sec": 3600.0,
-        }
+    await db.execute(
+        "INSERT INTO lot_history (lot_id, eq_id, action, timestamp, qty_good, qty_reject, process_sec) "
+        "VALUES ('LX', 'FT-01', 'TRACK_OUT', $1, 6000, 200, 3600.0)",
+        start + timedelta(hours=1),
     )
 
     oee = await equipment_service.calc_oee(db, "FT-01", start, end)
@@ -80,9 +79,10 @@ async def test_oee_excludes_non_scheduled_time(factory, clock):
     clock.advance(hours=2)
     end = clock.now
 
-    await db[COL_LOT_HISTORY].insert_one(
-        {"lot_id": "LX", "eq_id": "FT-01", "action": "TRACK_OUT",
-         "timestamp": start + timedelta(hours=3), "qty_good": 1000, "qty_reject": 0, "process_sec": 3600.0}
+    await db.execute(
+        "INSERT INTO lot_history (lot_id, eq_id, action, timestamp, qty_good, qty_reject, process_sec) "
+        "VALUES ('LX', 'FT-01', 'TRACK_OUT', $1, 1000, 0, 3600.0)",
+        start + timedelta(hours=3),
     )
     oee = await equipment_service.calc_oee(db, "FT-01", start, end)
     assert oee["scheduled_sec"] == pytest.approx(7200, abs=1)

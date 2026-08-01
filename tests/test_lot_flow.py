@@ -1,9 +1,11 @@
 """批號主流程：開批 → 進出站 → 單位換算 → 完工。"""
 
+from datetime import timedelta
+
 import pytest
 
-from app.database import COL_LOT_HISTORY
 from app.errors import StateError, ValidationError
+from app.models.base import utcnow
 from app.models.enums import EquipmentState, LotStatus, UnitType
 from app.services import lot_service, workorder_service
 from tests.conftest import GROSS_DIE
@@ -27,7 +29,7 @@ async def test_create_lot_from_work_order(factory, users):
     assert wo["status"] == "IN_PROGRESS"
 
     # 晶圓已被綁定，不可重複投入
-    wafer = await db["wafers"].find_one({"wafer_id": lot["wafer_ids"][0]})
+    wafer = await db.fetchrow("SELECT * FROM wafers WHERE wafer_id = $1", lot["wafer_ids"][0])
     assert wafer["consumed"] is True
     assert wafer["assembly_lot_id"] == lot["lot_id"]
 
@@ -45,7 +47,7 @@ async def test_cannot_open_lot_on_draft_work_order(factory):
     wo = await workorder_service.create_work_order(
         db,
         {"device_id": "TEST-QFN48", "plan_qty": 10, "unit_type": "WAFER",
-         "due_date": "2030-01-01T00:00:00Z", "priority": 5, "customer_po": "", "remark": ""},
+         "due_date": utcnow() + timedelta(days=7), "priority": 5, "customer_po": "", "remark": ""},
         "planner01",
     )
     with pytest.raises(StateError, match="需先下達"):
@@ -112,20 +114,20 @@ async def test_equipment_state_follows_lot(factory, users):
     await run_step(db, users, lot["lot_id"])  # 進到 WFR_SAW
 
     await lot_service.track_in(db, {"lot_id": lot["lot_id"], "eq_id": "DS-01"}, users["op001"])
-    eq = await db["equipments"].find_one({"eq_id": "DS-01"})
+    eq = await db.fetchrow("SELECT * FROM equipments WHERE eq_id = 'DS-01'")
     assert eq["current_state"] == EquipmentState.PRODUCTIVE.value
     assert eq["current_lot_id"] == lot["lot_id"]
 
     await run_step_out(db, users, lot["lot_id"])
-    eq = await db["equipments"].find_one({"eq_id": "DS-01"})
+    eq = await db.fetchrow("SELECT * FROM equipments WHERE eq_id = 'DS-01'")
     assert eq["current_state"] == EquipmentState.STANDBY.value
     assert eq["current_lot_id"] is None
 
 
 async def run_step_out(db, users, lot_id: str) -> dict:
     lot = await lot_service.get_lot(db, lot_id, raw=True)
-    operation = await db["operations"].find_one({"op_code": lot["current_op"]})
-    device = await db["devices"].find_one({"device_id": lot["device_id"]})
+    operation = await db.fetchrow("SELECT * FROM operations WHERE op_code = $1", lot["current_op"])
+    device = await db.fetchrow("SELECT * FROM devices WHERE device_id = $1", lot["device_id"])
     expected, _ = lot_service.compute_expected_output(
         int(lot["qty"]), operation, device, lot["unit_type"]
     )
@@ -148,9 +150,9 @@ async def test_scrapped_when_no_good_units_left(factory, users):
 
 async def test_material_consumption_recorded(factory, users):
     db = factory
-    await db["materials"].insert_one(
-        {"material_id": "WIRE-AU-08", "name": "金線", "material_type": "WIRE",
-         "uom": "M", "on_hand_qty": 1000.0, "safety_stock": 100.0, "active": True}
+    await db.execute(
+        "INSERT INTO materials (material_id, name, material_type, uom, on_hand_qty, safety_stock) "
+        "VALUES ('WIRE-AU-08', '金線', 'WIRE', 'M', 1000.0, 100.0)"
     )
     lot = await make_lot(db, qty=1)
     await advance_to(db, users, lot["lot_id"], "WIRE_BOND")
@@ -163,22 +165,23 @@ async def test_material_consumption_recorded(factory, users):
          "bin_map": None, "remark": ""},
         users["op001"],
     )
-    material = await db["materials"].find_one({"material_id": "WIRE-AU-08"})
+    material = await db.fetchrow("SELECT * FROM materials WHERE material_id = 'WIRE-AU-08'")
     assert material["on_hand_qty"] == pytest.approx(879.5)
-    txn = await db["material_transactions"].find_one({"lot_id": lot["lot_id"]})
+    txn = await db.fetchrow("SELECT * FROM material_transactions WHERE lot_id = $1", lot["lot_id"])
     assert txn["qty"] == -120.5 and txn["material_lot"] == "AU-L01"
 
-    history = await db[COL_LOT_HISTORY].find_one(
-        {"lot_id": lot["lot_id"], "op_code": "WIRE_BOND", "action": "TRACK_OUT"}
+    history = await db.fetchrow(
+        "SELECT * FROM lot_history WHERE lot_id = $1 AND op_code = 'WIRE_BOND' AND action = 'TRACK_OUT'",
+        lot["lot_id"],
     )
     assert history["materials"][0]["material_id"] == "WIRE-AU-08"
 
 
 async def test_material_shortage_blocks_track_out(factory, users):
     db = factory
-    await db["materials"].insert_one(
-        {"material_id": "WIRE-AU-08", "name": "金線", "material_type": "WIRE",
-         "uom": "M", "on_hand_qty": 10.0, "safety_stock": 0.0, "active": True}
+    await db.execute(
+        "INSERT INTO materials (material_id, name, material_type, uom, on_hand_qty, safety_stock) "
+        "VALUES ('WIRE-AU-08', '金線', 'WIRE', 'M', 10.0, 0.0)"
     )
     lot = await make_lot(db, qty=1)
     await advance_to(db, users, lot["lot_id"], "WIRE_BOND")

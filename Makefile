@@ -3,13 +3,13 @@
 install:          ## 安裝相依套件
 	pip install -r requirements.txt
 
-demo:             ## 一鍵展示（記憶體資料庫，免安裝 MongoDB）
+demo:             ## 一鍵展示（內嵌 PostgreSQL，免安裝資料庫）
 	python -m scripts.demo --days 3
 
-seed:             ## 建立主檔（需要 MongoDB）
+seed:             ## 建立主檔（需要 PostgreSQL）
 	python -m scripts.seed
 
-simulate:         ## 模擬 3 天生產資料（需要 MongoDB）
+simulate:         ## 模擬 3 天生產資料（需要 PostgreSQL）
 	python -m scripts.simulate --days 3
 
 run:              ## 啟動 API 服務

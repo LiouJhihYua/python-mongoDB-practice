@@ -1,4 +1,4 @@
-"""共用模型工具：時間、文件序列化、分頁。"""
+"""共用模型工具：時間、班別、序列化、分頁。"""
 
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.config import settings
 
 T = TypeVar("T")
-
 
 #: 可注入的時間來源；模擬產線與測試會覆寫它，正式執行時為 None
 _clock: Callable[[], datetime] | None = None
@@ -27,15 +26,13 @@ def utcnow() -> datetime:
 
 
 def ensure_aware(dt: datetime) -> datetime:
-    """MongoDB 取回的時間可能沒有時區資訊，一律補成 UTC 再運算。"""
+    """補上時區資訊再運算（PostgreSQL 的 timestamptz 本身就帶時區）。"""
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def to_local(dt: datetime) -> datetime:
     """轉成廠區當地時間（用於班別與日報切分）。"""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone(timedelta(hours=settings.tz_offset_hours)))
+    return ensure_aware(dt).astimezone(timezone(timedelta(hours=settings.tz_offset_hours)))
 
 
 def shift_of(dt: datetime) -> str:
@@ -77,34 +74,15 @@ def shift_window(label: str) -> tuple[datetime, datetime]:
     return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
 
 
-def mongo_encode(value: Any) -> Any:
-    """遞迴把 Enum 轉成原生字串，確保寫入 MongoDB 的都是純量。"""
+def plain_values(value: Any) -> Any:
+    """遞迴把 Enum 轉成原生字串，確保寫入資料庫的都是純量。"""
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):
-        return {k: mongo_encode(v) for k, v in value.items()}
+        return {k: plain_values(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [mongo_encode(v) for v in value]
+        return [plain_values(v) for v in value]
     return value
-
-
-def to_mongo(model: BaseModel, **kwargs: Any) -> dict:
-    """Pydantic 模型 → MongoDB 文件。"""
-    return mongo_encode(model.model_dump(**kwargs))
-
-
-def clean(doc: dict | None) -> dict | None:
-    """MongoDB 文件 → API 回應（把 ObjectId 轉字串）。"""
-    if doc is None:
-        return None
-    out = dict(doc)
-    if "_id" in out:
-        out["id"] = str(out.pop("_id"))
-    return out
-
-
-def clean_all(docs: list[dict]) -> list[dict]:
-    return [clean(d) for d in docs]
 
 
 class MESModel(BaseModel):

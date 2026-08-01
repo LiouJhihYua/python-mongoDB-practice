@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
-from app.database import close_db, connect_db, get_db
+from app.database import acquire, close_db, connect_db
 from app.errors import MESError
 from app.routers import (
     audit,
@@ -49,7 +49,8 @@ startup_hooks: list[Callable[[], Awaitable[None]]] = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_db()
-    await ensure_bootstrap_admin(get_db())
+    async with acquire() as conn:
+        await ensure_bootstrap_admin(conn)
     for hook in startup_hooks:
         await hook()
     logger.info(
@@ -64,8 +65,9 @@ app = FastAPI(
     title=f"{settings.app_name} — OSAT 封裝測試廠製造執行系統",
     version=settings.app_version,
     description=(
-        "涵蓋主檔、工單、批號進出站、拆併批、扣留放行、設備 OEE、"
-        "品質分析、材料耗用與正逆向追溯的 MES API。"
+        "涵蓋主檔、工單、批號進出站、拆併批、扣留放行、派工、SPC、設備 OEE、"
+        "治具壽命、品質分析、材料耗用與正逆向追溯的 MES API。"
+        "後端為 PostgreSQL，全套採寬鬆開源授權。"
     ),
     lifespan=lifespan,
 )
@@ -102,15 +104,16 @@ async def audit_middleware(request: Request, call_next):
     started = time.perf_counter()
     response = await call_next(request)
     try:
-        await audit_service.record_api(
-            get_db(),
-            _actor_from_request(request),
-            request.method,
-            request.url.path,
-            response.status_code,
-            (time.perf_counter() - started) * 1000,
-            request.url.query,
-        )
+        async with acquire() as conn:
+            await audit_service.record_api(
+                conn,
+                _actor_from_request(request),
+                request.method,
+                request.url.path,
+                response.status_code,
+                (time.perf_counter() - started) * 1000,
+                request.url.query,
+            )
     except Exception as exc:  # 稽核失敗不可影響正常作業
         logger.warning("寫入稽核紀錄失敗：%s", exc)
     return response
@@ -135,15 +138,19 @@ for module in (
 
 @app.get("/api/health", tags=["系統"], summary="健康檢查")
 async def health():
-    db = get_db()
-    collections = await db.list_collection_names()
+    async with acquire() as conn:
+        tables = await conn.fetchval(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
+        )
+        version = await conn.fetchval("SHOW server_version")
     return {
         "status": "ok",
         "app": settings.app_name,
         "version": settings.app_version,
         "factory": settings.factory_code,
         "db_backend": settings.db_backend,
-        "collections": len(collections),
+        "database": f"PostgreSQL {version}",
+        "tables": tables,
     }
 
 

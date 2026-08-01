@@ -39,25 +39,25 @@ def test_expired_token_rejected():
         decode_access_token(token)
 
 
-def test_login_ok(client):
-    res = client.post("/api/auth/login", json={"username": "admin", "password": "admin1234"})
+async def test_login_ok(client):
+    res = await client.post("/api/auth/login", json={"username": "admin", "password": "admin1234"})
     assert res.status_code == 200
     assert res.json()["user"]["roles"] == ["admin"]
 
 
-def test_login_wrong_password(client):
-    res = client.post("/api/auth/login", json={"username": "admin", "password": "nope"})
+async def test_login_wrong_password(client):
+    res = await client.post("/api/auth/login", json={"username": "admin", "password": "nope"})
     assert res.status_code == 401
 
 
-def test_endpoint_requires_auth(client):
-    assert client.get("/api/lots").status_code == 401
+async def test_endpoint_requires_auth(client):
+    assert (await client.get("/api/lots")).status_code == 401
 
 
-def test_viewer_cannot_create_work_order(client, token):
-    res = client.post(
+async def test_viewer_cannot_create_work_order(client, token):
+    res = await client.post(
         "/api/work-orders",
-        headers=token("viewer01"),
+        headers=await token("viewer01"),
         json={"device_id": "TEST-QFN48", "plan_qty": 10, "unit_type": "WAFER",
               "due_date": "2030-01-01T00:00:00Z"},
     )
@@ -65,10 +65,10 @@ def test_viewer_cannot_create_work_order(client, token):
     assert "權限不足" in res.json()["detail"]
 
 
-def test_planner_can_create_work_order(client, token):
-    res = client.post(
+async def test_planner_can_create_work_order(client, token):
+    res = await client.post(
         "/api/work-orders",
-        headers=token("planner01"),
+        headers=await token("planner01"),
         json={"device_id": "TEST-QFN48", "plan_qty": 10, "unit_type": "WAFER",
               "due_date": "2030-01-01T00:00:00Z"},
     )
@@ -76,11 +76,11 @@ def test_planner_can_create_work_order(client, token):
     assert res.json()["wo_no"].startswith("WO")
 
 
-def test_admin_bypasses_role_check(client, token):
+async def test_admin_bypasses_role_check(client, token):
     """admin 不必掛生管角色也能操作。"""
-    res = client.post(
+    res = await client.post(
         "/api/work-orders",
-        headers=token("admin"),
+        headers=await token("admin"),
         json={"device_id": "TEST-QFN48", "plan_qty": 10, "unit_type": "WAFER",
               "due_date": "2030-01-01T00:00:00Z"},
     )

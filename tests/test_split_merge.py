@@ -169,9 +169,9 @@ async def test_forward_trace_from_wafer(factory, users):
 
 async def test_where_used_for_material_lot(factory, users):
     db = factory
-    await db["materials"].insert_one(
-        {"material_id": "WIRE-AU-08", "name": "金線", "material_type": "WIRE",
-         "uom": "M", "on_hand_qty": 5000.0, "safety_stock": 0.0, "active": True}
+    await db.execute(
+        "INSERT INTO materials (material_id, name, material_type, uom, on_hand_qty, safety_stock) "
+        "VALUES ('WIRE-AU-08', '金線', 'WIRE', 'M', 5000.0, 0.0)"
     )
     lot = await make_lot(db, qty=1)
     await advance_to(db, users, lot["lot_id"], "WIRE_BOND")

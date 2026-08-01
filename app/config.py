@@ -11,14 +11,17 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "OSAT MES"
-    app_version: str = "1.0.0"
+    app_version: str = "2.0.0"
 
-    # ── 資料庫 ──────────────────────────────────────────────
-    # mongo  = 連線真實 MongoDB
-    # memory = 使用 mongomock 的記憶體資料庫（展示／測試用，重啟即清空）
-    db_backend: str = "mongo"
-    mongodb_url: str = "mongodb://localhost:27017"
-    mongodb_db: str = "osat_mes"
+    # ── 資料庫（PostgreSQL）────────────────────────────────
+    # postgres = 連線既有的 PostgreSQL（正式環境）
+    # embedded = 用 pgserver 就地啟動一個 PostgreSQL（展示／測試，免安裝）
+    db_backend: str = "postgres"
+    database_url: str = "postgresql://mes:mes@localhost:5432/osat_mes"
+    database_name: str = "osat_mes"
+    embedded_data_dir: str = "./data/pgdata"
+    db_pool_min: int = 1
+    db_pool_max: int = 10
 
     # ── 認證 ────────────────────────────────────────────────
     jwt_secret: str = "dev-only-secret-change-me"
