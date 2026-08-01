@@ -1,5 +1,7 @@
 """派工排序、Q-Time 預警、稽核軌跡與交接班報表。"""
 
+from datetime import timedelta
+
 import pytest
 
 from app.models.base import shift_of, shift_window, utcnow
@@ -183,6 +185,11 @@ def test_shift_window_rejects_bad_label():
 
 async def test_shift_handover_report(factory, users, clock):
     db = factory
+    # 把時鐘挪到本班開頭，否則測試若剛好在換班前一小時執行，
+    # clock.advance(hours=1) 會跨到下一班，統計自然是空的
+    shift_start, _ = shift_window(shift_of(clock.now))
+    clock.now = shift_start + timedelta(minutes=1)
+
     lot = await make_lot(db, qty=2)
     await run_step(db, users, lot["lot_id"])
     await run_step(db, users, lot["lot_id"], "DS-01", 20, "SAW-CHIP")

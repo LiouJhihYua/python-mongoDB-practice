@@ -1,4 +1,4 @@
-.PHONY: install demo seed simulate run test docker-up docker-down
+.PHONY: install demo seed simulate run eqsim test docker-up docker-down
 
 install:          ## 安裝相依套件
 	pip install -r requirements.txt
@@ -14,6 +14,9 @@ simulate:         ## 模擬 3 天生產資料（需要 PostgreSQL）
 
 run:              ## 啟動 API 服務
 	uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+eqsim:            ## 啟動 SECS/GEM 設備模擬器（預設埠 5001）
+	python -m scripts.eqsim --port 5001 --eq-id WB-01
 
 test:             ## 執行測試
 	python -m pytest

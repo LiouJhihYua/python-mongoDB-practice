@@ -36,9 +36,13 @@
       <button data-view="equipment">設備管理</button>
       <button data-view="tools">治具管理</button>
       <button data-view="quality">品質管理</button>
+      <button data-view="wafermap">晶圓 Map</button>
+      <button data-view="sop">e-SOP</button>
       <button data-view="trace">追溯查詢</button>
       <button data-view="orders">工單</button>
       <button data-view="handover">交接班</button>
+      <button data-view="erp">ERP 介接</button>
+      <button data-view="secs">SECS/GEM</button>
     </nav>
     <div class="user">登入者：<b id="who">-</b></div>
     <button class="icon-btn" id="theme-toggle" title="切換深／淺色">深色</button>
@@ -346,6 +350,76 @@
       </div>
     </section>
 
+    <!-- 晶圓 Map -->
+    <section class="view" id="view-wafermap">
+      <div class="toolbar">
+        <input id="wm-lot" placeholder="晶圓母批（例 WMT6893001）" style="min-width:220px" />
+        <button class="btn primary" id="wm-refresh">查詢</button>
+        <span class="muted">點選左表的晶圓即可看 Map 與分析</span>
+      </div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>晶圓 Map 清單 <small id="wm-count"></small></h3>
+          <div class="table-wrap"><table id="t-wafermaps"></table></div>
+        </div>
+        <div class="card">
+          <h3>Bin Map <small id="wm-title">尚未選擇晶圓</small></h3>
+          <canvas id="wm-canvas" width="420" height="420"
+                  style="width:100%;max-width:420px;image-rendering:pixelated"></canvas>
+          <div id="wm-legend" class="muted" style="margin-top:10px;font-size:12px"></div>
+        </div>
+        <div class="card">
+          <h3>良率分析 <small class="muted">邊緣良率與群聚不良</small></h3>
+          <div class="grid kpis" id="wm-kpis"></div>
+          <ul id="wm-findings" style="margin:12px 0 0 18px;line-height:1.9"></ul>
+          <h3 style="margin:18px 0 10px">不良 Bin 帕累托</h3>
+          <table id="t-wm-pareto"></table>
+        </div>
+        <div class="card">
+          <h3>Die 級追溯 <small class="muted">成品序號 ↔ 晶圓座標</small></h3>
+          <div class="toolbar">
+            <input id="wm-die-lot" placeholder="批號" style="min-width:170px" />
+            <input id="wm-die-seq" placeholder="成品序號" style="min-width:110px" />
+            <button class="btn primary" id="wm-die-go">查詢</button>
+          </div>
+          <div class="table-wrap"><table id="t-wm-dies"></table></div>
+          <pre class="json" id="wm-die-out" style="margin-top:12px">輸入批號與成品序號後查詢</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- e-SOP -->
+    <section class="view" id="view-sop">
+      <div class="toolbar">
+        <select id="sop-op"><option value="">全部站別</option></select>
+        <select id="sop-status">
+          <option value="">全部狀態</option>
+          <option value="RELEASED" selected>生效中</option>
+          <option value="DRAFT">草稿</option>
+          <option value="OBSOLETE">已作廢</option>
+        </select>
+        <button class="btn primary" id="sop-refresh">查詢</button>
+      </div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>作業指導書 <small class="muted">點選查看內容</small></h3>
+          <div class="table-wrap"><table id="t-sops"></table></div>
+        </div>
+        <div class="card">
+          <h3>內容 <small id="sop-title">尚未選擇</small></h3>
+          <div id="sop-detail" class="muted">請自左側選擇一份 SOP</div>
+        </div>
+        <div class="card">
+          <h3>我尚未簽認 <small class="muted">上工前必須完成</small></h3>
+          <div class="table-wrap"><table id="t-sop-pending"></table></div>
+        </div>
+        <div class="card">
+          <h3>簽認率 <small class="muted">稽核調閱用</small></h3>
+          <div class="table-wrap"><table id="t-sop-compliance"></table></div>
+        </div>
+      </div>
+    </section>
+
     <!-- 交接班 -->
     <section class="view" id="view-handover">
       <div class="toolbar">
@@ -372,6 +446,67 @@
           <div class="table-wrap"><table id="t-ho-spc"></table></div>
           <h3 style="margin:18px 0 10px">治具</h3>
           <table id="t-ho-tools"></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ERP 介接 -->
+    <section class="view" id="view-erp">
+      <div class="toolbar">
+        <button class="btn primary" id="erp-refresh">重新整理</button>
+        <button class="btn" id="erp-process">處理待辦下行單據</button>
+        <button class="btn" id="erp-build">彙整上行單據（近 24 小時）</button>
+        <select id="erp-doc-type" title="上行單據類型">
+          <option value="">全部上行單據</option>
+          <option value="PRODUCTION_REPORT">完工回報</option>
+          <option value="MATERIAL_ISSUE">材料領用</option>
+          <option value="SHIPMENT">出貨</option>
+          <option value="SCRAP">報廢</option>
+        </select>
+        <button class="btn" id="erp-export">匯出 CSV</button>
+      </div>
+      <div class="grid kpis" id="erp-kpis"></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>下行單據（ERP → MES）<small class="muted">相同單號重送不會重複建檔</small></h3>
+          <div class="table-wrap"><table id="t-erp-in"></table></div>
+        </div>
+        <div class="card">
+          <h3>上行單據（MES → ERP）<small class="muted">送出後需回 ACK 才算完成</small></h3>
+          <div class="table-wrap"><table id="t-erp-out"></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECS/GEM -->
+    <section class="view" id="view-secs">
+      <div class="toolbar">
+        <button class="btn primary" id="secs-refresh">重新整理</button>
+        <select id="secs-eq"><option value="">全部設備</option></select>
+        <input id="secs-ceid" placeholder="CEID（例 2001）" style="min-width:150px" />
+        <button class="btn" id="secs-simulate">模擬設備事件</button>
+      </div>
+      <div class="grid kpis" id="secs-kpis"></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>設備連線 <small class="muted">HSMS-SS，MES 端為 ACTIVE</small></h3>
+          <div class="table-wrap"><table id="t-secs-links"></table></div>
+        </div>
+        <div class="card">
+          <h3>事件對應規則 <small class="muted">CEID → MES 動作</small></h3>
+          <div class="table-wrap"><table id="t-secs-rules"></table></div>
+        </div>
+        <div class="card">
+          <h3>訊息記錄 <small class="muted">點選查看 SML</small></h3>
+          <div class="table-wrap"><table id="t-secs-msgs"></table></div>
+        </div>
+        <div class="card">
+          <h3>訊息解析 <small class="muted">貼上 HSMS 十六進位</small></h3>
+          <div class="toolbar">
+            <input id="secs-hex" placeholder="0000000b0000..." style="flex:1;min-width:260px" />
+            <button class="btn primary" id="secs-decode">解析</button>
+          </div>
+          <pre class="json" id="secs-out">選擇訊息或貼上十六進位字串</pre>
         </div>
       </div>
     </section>

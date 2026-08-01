@@ -12,12 +12,14 @@ import asyncio
 import logging
 import random
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.database import connect_db, truncate_all  # noqa: E402
 from app.errors import DuplicateError  # noqa: E402
+from app.models.base import utcnow  # noqa: E402
 from app.models.enums import (  # noqa: E402
     DefectCategory,
     DispositionType,
@@ -437,7 +439,197 @@ async def _seed(db, reset: bool) -> None:
                 )
                 wafer_count += ok
     log.info("晶圓：新增 %d 片", wafer_count)
+
+    await _seed_wafer_maps(db, rng)
+    await _seed_sops(db)
+    await _seed_secs(db)
+    await _seed_erp(db)
     log.info("主檔建立完成。預設帳號：admin / admin1234，其餘帳號密碼為「帳號+1234」")
+
+
+# ── 晶圓 Map ────────────────────────────────────────────────
+def make_cp_map(gross_die: int, rng: random.Random, cp_yield: float) -> list[list[int]]:
+    """依理論粒數產生一張像樣的 CP map。
+
+    刻意做出 OSAT 現場真的會看到的兩種樣態：邊緣良率偏低，
+    以及一塊群聚不良 —— 這樣分析頁一打開就有東西可看。
+    """
+    size = max(8, int((gross_die / 0.785) ** 0.5))  # 圓形面積約佔外接正方形 78.5%
+    radius, center = size / 2 - 0.5, (size - 1) / 2
+    grid: list[list[int]] = []
+    for y in range(size):
+        row: list[int] = []
+        for x in range(size):
+            distance = ((x - center) ** 2 + (y - center) ** 2) ** 0.5
+            if distance > radius:
+                row.append(-1)
+                continue
+            # 越靠邊緣越容易掛，這是晶圓廠的常態
+            edge_penalty = max(0.0, (distance / radius - 0.82)) * 0.6
+            if rng.random() < (1 - cp_yield) + edge_penalty:
+                row.append(rng.choice([2, 2, 3, 4, 5]))
+            else:
+                row.append(1)
+        grid.append(row)
+
+    if rng.random() < 0.35:  # 三成的晶圓種一塊群聚不良
+        cx, cy = rng.randint(4, size - 6), rng.randint(4, size - 6)
+        for y in range(cy, min(cy + rng.randint(3, 5), size)):
+            for x in range(cx, min(cx + rng.randint(3, 5), size)):
+                if grid[y][x] != -1:
+                    grid[y][x] = 7
+    return grid
+
+
+async def _seed_wafer_maps(db, rng: random.Random) -> None:
+    """為第一個晶圓母批上傳 CP map（全部上傳太慢，示範用足夠）。"""
+    from app.services import wafermap_service
+
+    count = 0
+    for device_id, _, _, _, gross, *_rest in DEVICES:
+        wafer_lot = f"W{device_id.split('-')[0]}001"
+        wafers = await db.fetch(
+            "SELECT wafer_id, gross_die FROM wafers WHERE wafer_lot_id = $1 ORDER BY wafer_id LIMIT 6",
+            wafer_lot,
+        )
+        for wafer in wafers:
+            grid = make_cp_map(int(wafer["gross_die"]), rng, rng.uniform(0.93, 0.99))
+            count += await _try(
+                wafermap_service.upload_map(
+                    db,
+                    {"wafer_id": wafer["wafer_id"], "source": "CP", "grid": grid,
+                     "pass_bins": [1], "null_bin": -1, "update_wafer": True, "remark": "示範資料"},
+                    ACTOR,
+                ),
+                wafer["wafer_id"],
+            )
+    log.info("晶圓 Map：新增 %d 張", count)
+
+
+# ── e-SOP ───────────────────────────────────────────────────
+SOPS = [
+    ("SOP-WB-001", "打線接合標準作業", "WIRE_BOND",
+     [("確認機台完成暖機並取得當日首件核可", "首件拉力 ≧ 3.0 gf"),
+      ("依工單核對治具編號與毛細管壽命", "毛細管累計顆數未達 85%"),
+      ("裝載 Magazine，確認方向標記朝上", "料號與工單一致"),
+      ("每 30 分鐘抽測銲線拉力並登錄 SPC", "落在管制界限內"),
+      ("結批前確認機台無異常告警", "無 Alarm")],
+     "高溫夾治具、金線靜電", ["防靜電衣", "防靜電手環", "手套"]),
+    ("SOP-SAW-001", "晶圓切割標準作業", "WFR_SAW",
+     [("確認切割刀已完成 dressing", "刀具跳動 < 5 um"),
+      ("設定切割道寬度並試切三刀", "切割道寬度 25–45 um"),
+      ("確認冷卻水流量與水質", "流量 ≧ 1.0 L/min"),
+      ("每片檢查崩角情形", "崩角 < 30 um")],
+     "高速旋轉刀具、切削水", ["護目鏡", "手套"]),
+    ("SOP-FT-001", "最終測試標準作業", "FT",
+     [("確認測試程式版本與工單一致", "程式版本正確"),
+      ("執行 Correlation 樣品並比對結果", "與標準片誤差 < 2%"),
+      ("確認測試座壽命未超標", "測試座累計顆數未達上限"),
+      ("結批前輸出 Bin 分佈並上傳 MES", "Bin 合計等於進站量")],
+     "高溫測試座", ["防靜電衣", "手套"]),
+]
+
+
+async def _seed_sops(db) -> None:
+    from app.services import sop_service
+
+    created = 0
+    for sop_code, title, op_code, steps, hazards, ppe in SOPS:
+        ok = await _try(
+            sop_service.create_sop(
+                db,
+                {
+                    "sop_code": sop_code, "title": title, "op_code": op_code, "device_id": "",
+                    "summary": f"{op_code} 站標準作業程序",
+                    "steps": [
+                        {"seq": i, "instruction": text, "detail": "", "image": "",
+                         "checkpoint": check, "duration_sec": 60}
+                        for i, (text, check) in enumerate(steps, start=1)
+                    ],
+                    "hazards": hazards, "ppe": ppe, "attachments": [], "require_ack": True,
+                },
+                ACTOR,
+            ),
+            sop_code,
+        )
+        if ok:
+            # 生效日往前壓，示範資料才不會出現「SOP 還沒生效就開始生產」
+            await _try(
+                sop_service.release_sop(
+                    db, sop_code, 1, {"effective_from": utcnow() - timedelta(days=90)}, ACTOR
+                ),
+                sop_code,
+            )
+            created += 1
+
+    # 打線站示範「未簽認就不能進站」的管制
+    await db.execute("UPDATE operations SET require_sop_ack = TRUE WHERE op_code = 'WIRE_BOND'")
+    for username in ("op001", "eng01"):
+        await _try(
+            sop_service.acknowledge(db, {"sop_code": "SOP-WB-001", "version": 1}, username), username
+        )
+    log.info("e-SOP：新增 %d 份（打線站已開啟簽認管制）", created)
+
+
+# ── SECS/GEM ────────────────────────────────────────────────
+#: eq_id, HSMS 埠
+SECS_LINKS = [("WB-01", 5001), ("WB-02", 5002), ("DB-01", 5003), ("FT-01", 5004)]
+
+#: ceid, 名稱, 動作, 參數
+SECS_RULES = [
+    (2001, "開始加工", "EQ_STATE", {"state": "PRODUCTIVE"}),
+    (2002, "加工結束", "TRACK_OUT_READY", {}),
+    (2003, "設備狀態變更", "EQ_STATE", {"state_vid": "1.0"}),
+    (2004, "設備異常", "ALARM", {"remark": "設備回報異常"}),
+    (2005, "換料完成", "LOG_ONLY", {}),
+]
+
+
+async def _seed_secs(db) -> None:
+    from app.services import secs_service
+
+    for eq_id, port in SECS_LINKS:
+        await _try(
+            secs_service.upsert_link(
+                db, eq_id,
+                {"host": "127.0.0.1", "port": port, "session_id": 0, "mode": "ACTIVE",
+                 "enabled": False},  # 預設不自動連線，避免沒有機台時一直重試
+                ACTOR,
+            ),
+            eq_id,
+        )
+    for ceid, name, action, params in SECS_RULES:
+        await _try(
+            secs_service.upsert_rule(
+                db, {"eq_id": "", "ceid": ceid, "name": name, "action": action,
+                     "params": params, "enabled": True},
+                ACTOR,
+            ),
+            f"CEID {ceid}",
+        )
+    log.info("SECS/GEM：連線設定 %d 台、事件規則 %d 條（連線預設停用）",
+             len(SECS_LINKS), len(SECS_RULES))
+
+
+# ── ERP 介接 ────────────────────────────────────────────────
+async def _seed_erp(db) -> None:
+    """放一筆待處理的下行單據，讓介接頁面一打開就有東西可操作。"""
+    from app.services import erp_service
+
+    await _try(
+        erp_service.receive(
+            db,
+            {
+                "doc_type": "CUSTOMER", "external_id": "ERP-CUST-DEMO",
+                "payload": {"code": "AMD", "name": "超微半導體", "contact": "Lisa",
+                            "email": "amd-scm@example.com"},
+                "source": "REST",
+            },
+            ACTOR,
+        ),
+        "ERP-CUST-DEMO",
+    )
+    log.info("ERP：已放入 1 筆待處理的下行單據")
 
 
 if __name__ == "__main__":

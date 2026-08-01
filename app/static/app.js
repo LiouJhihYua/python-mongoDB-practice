@@ -82,6 +82,8 @@ const barCell = (ratio, kind = "") =>
 const yieldKind = (y) => (y >= 0.98 ? "ok" : y >= 0.95 ? "warn" : "bad");
 /** 累計良率跨十幾站連乘，門檻自然低得多，另訂一組。 */
 const cumulativeKind = (y) => (y >= 0.9 ? "ok" : y >= 0.85 ? "warn" : "bad");
+/** 晶圓 CP 良率是晶圓廠的成績，九成多屬正常，不能套封裝站的門檻。 */
+const cpYieldKind = (y) => (y >= 0.95 ? "ok" : y >= 0.9 ? "warn" : "bad");
 
 /* ── 登入 ────────────────────────────────────────────── */
 $("#login-form").addEventListener("submit", async (event) => {
@@ -139,7 +141,8 @@ document.querySelectorAll("nav button").forEach((btn) => {
       dashboard: loadDashboard, dispatch: loadDispatch, lots: loadLots,
       shopfloor: loadMeasurementItems, spc: loadSpc, equipment: loadOee,
       tools: loadTools, quality: loadQuality, orders: loadWorkOrders,
-      handover: loadHandover,
+      handover: loadHandover, wafermap: loadWaferMaps, sop: loadSops,
+      erp: loadErp, secs: loadSecs,
     };
     loaders[btn.dataset.view]?.();
   });
@@ -811,6 +814,432 @@ async function loadHandover() {
     ], d.spc_violations, "本班沒有 SPC 異常");
 
     renderTable("#t-ho-tools", TOOL_ALERT_COLUMNS, d.tools_to_change, "沒有治具需要更換");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+/* ── 晶圓 Map ────────────────────────────────────────── */
+/** Bin 配色：良品綠、晶圓外留白，其餘依 Bin 編號循環取色。 */
+const BIN_COLORS = ["#d94b4b", "#e08a2e", "#c9a227", "#8e5fd0", "#2e9bb5", "#b5548e", "#5f7fd0"];
+const binColor = (bin, passBins) =>
+  passBins.includes(bin) ? "#3f9a5a" : BIN_COLORS[Math.abs(bin) % BIN_COLORS.length];
+
+$("#wm-refresh").addEventListener("click", loadWaferMaps);
+
+async function loadWaferMaps() {
+  try {
+    const lot = $("#wm-lot").value.trim();
+    const maps = await api(`/api/wafer/maps${lot ? `?wafer_lot_id=${encodeURIComponent(lot)}` : ""}`);
+    $("#wm-count").textContent = `共 ${maps.length} 張`;
+    renderTable("#t-wafermaps", [
+      { title: "晶圓", render: (r) => `<a href="#" data-wafer="${esc(r.wafer_id)}">${esc(r.wafer_id)}</a>` },
+      { title: "母批", key: "wafer_lot_id" },
+      { title: "料號", key: "device_id" },
+      { title: "晶粒", num: true, render: (r) => num(r.die_count) },
+      { title: "良品", num: true, render: (r) => num(r.pass_count) },
+      { title: "CP 良率", num: true, render: (r) => barCell(Number(r.yield), cpYieldKind(Number(r.yield))) },
+      { title: "投入批號", render: (r) => esc(r.assembly_lot_id || "-") },
+    ], maps, "尚無晶圓 Map，可由工程師上傳");
+
+    $("#t-wafermaps").querySelectorAll("a[data-wafer]").forEach((link) => {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        showWaferMap(link.dataset.wafer);
+      });
+    });
+    if (maps.length) showWaferMap(maps[0].wafer_id);
+  } catch (err) { toast(err.message, "err"); }
+}
+
+async function showWaferMap(waferId) {
+  try {
+    const [map, analysis] = await Promise.all([
+      api(`/api/wafer/maps/${encodeURIComponent(waferId)}/grid?max_size=160`),
+      api(`/api/wafer/maps/${encodeURIComponent(waferId)}/analysis`),
+    ]);
+    $("#wm-title").textContent =
+      `${waferId}｜${map.source}｜${map.display_rows}×${map.display_cols}` +
+      (map.downsample_step > 1 ? `（每 ${map.downsample_step} 顆縮為 1 格）` : "");
+    drawWaferMap(map);
+
+    const e = analysis.edge;
+    $("#wm-kpis").innerHTML = [
+      { label: "CP 良率", value: pct(analysis.yield), foot: `${num(analysis.pass_count)} / ${num(analysis.die_count)}`, kind: cpYieldKind(analysis.yield) },
+      { label: "邊緣良率", value: pct(e.edge_yield), foot: `外 ${e.rings} 圈共 ${num(e.edge_die)} 顆`, kind: cpYieldKind(e.edge_yield) },
+      { label: "中心良率", value: pct(e.center_yield), foot: `${num(e.center_die)} 顆`, kind: cpYieldKind(e.center_yield) },
+      { label: "邊緣落差", value: pct(e.gap), foot: "中心 − 邊緣", kind: e.gap >= 0.05 ? "bad" : "ok" },
+      { label: "群聚不良", value: num(analysis.clusters.clustered_die), foot: `最大一群 ${num(analysis.clusters.largest_cluster)} 顆`, kind: analysis.clusters.cluster_count ? "warn" : "ok" },
+      { label: "不良總數", value: num(analysis.fail_count), foot: `${analysis.clusters.cluster_count} 個群聚` },
+    ].map((c) => `
+      <div class="kpi">
+        <div class="label">${esc(c.label)}</div>
+        <div class="value ${c.kind || ""}">${esc(String(c.value))}</div>
+        <div class="foot">${esc(c.foot)}</div>
+      </div>`).join("");
+
+    $("#wm-findings").innerHTML = analysis.findings.map((f) => `<li>${esc(f)}</li>`).join("");
+    renderTable("#t-wm-pareto", [
+      { title: "Bin", key: "bin" },
+      { title: "顆數", num: true, render: (r) => num(r.qty) },
+      { title: "占全片", num: true, render: (r) => barCell(r.ratio, "bad") },
+    ], analysis.bin_pareto.slice(0, 8), "全片無不良");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+function drawWaferMap(map) {
+  const canvas = $("#wm-canvas");
+  const ctx = canvas.getContext("2d");
+  const rows = map.grid.length, cols = map.grid[0]?.length || 1;
+  const cell = Math.max(1, Math.floor(Math.min(canvas.width / cols, canvas.height / rows)));
+  const offsetX = Math.floor((canvas.width - cell * cols) / 2);
+  const offsetY = Math.floor((canvas.height - cell * rows) / 2);
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const seen = new Map();
+  map.grid.forEach((row, y) => row.forEach((bin, x) => {
+    if (bin === map.null_bin) return;
+    const color = binColor(bin, map.pass_bins);
+    seen.set(bin, color);
+    ctx.fillStyle = color;
+    ctx.fillRect(offsetX + x * cell, offsetY + y * cell, cell, cell);
+  }));
+
+  $("#wm-legend").innerHTML = [...seen.entries()].sort((a, b) => a[0] - b[0]).map(([bin, color]) =>
+    `<span style="display:inline-flex;align-items:center;gap:4px;margin-right:12px">
+       <i style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${color}"></i>
+       Bin ${esc(bin)}${map.pass_bins.includes(bin) ? "（良品）" : ""}
+     </span>`).join("");
+}
+
+$("#wm-die-go").addEventListener("click", async () => {
+  const lotId = $("#wm-die-lot").value.trim();
+  const seq = $("#wm-die-seq").value.trim();
+  if (!lotId) { toast("請輸入批號", "err"); return; }
+  try {
+    const summary = await api(`/api/wafer/lots/${encodeURIComponent(lotId)}/die-summary`);
+    renderTable("#t-wm-dies", [
+      { title: "來源晶圓", key: "wafer_id" },
+      { title: "綁定顆數", num: true, render: (r) => num(r.total) },
+      { title: "測試 PASS", num: true, render: (r) => num(r.PASS || 0) },
+      { title: "測試 FAIL", num: true, render: (r) => num(r.FAIL || 0) },
+    ], summary.by_wafer, "此批號尚未綁定晶粒");
+
+    if (!seq) {
+      $("#wm-die-out").textContent = JSON.stringify(summary, null, 2);
+      return;
+    }
+    const die = await api(`/api/wafer/lots/${encodeURIComponent(lotId)}/units/${encodeURIComponent(seq)}`);
+    $("#wm-die-out").textContent =
+      `成品 ${lotId} #${seq}\n` +
+      `→ 晶圓 ${die.die.wafer_id} 座標 (${die.die.die_x}, ${die.die.die_y})\n` +
+      `→ CP Bin ${die.die.cp_bin}｜FT Bin ${die.die.ft_bin ?? "未測"}｜狀態 ${die.die.status}\n` +
+      `→ 晶圓母批 ${die.wafer?.wafer_lot_id ?? "-"}／晶圓廠 ${die.wafer?.fab ?? "-"}\n\n` +
+      `相鄰晶粒（判斷是否為群聚不良）：\n${JSON.stringify(die.neighbour_dies, null, 2)}`;
+  } catch (err) { $("#wm-die-out").textContent = err.message; toast(err.message, "err"); }
+});
+
+/* ── e-SOP ───────────────────────────────────────────── */
+const SOP_STATUS_TAG = { RELEASED: "RUNNING", DRAFT: "WAITING", OBSOLETE: "NON_SCHEDULED" };
+const SOP_STATUS_LABEL = { RELEASED: "生效中", DRAFT: "草稿", OBSOLETE: "已作廢" };
+
+$("#sop-refresh").addEventListener("click", loadSops);
+
+async function loadSops() {
+  try {
+    if ($("#sop-op").options.length <= 1) {
+      const ops = await api("/api/master/operations?limit=200");
+      ops.items.forEach((op) =>
+        $("#sop-op").appendChild(el("option", { value: op.op_code }, `${op.op_code} ${op.name}`)));
+    }
+    const params = new URLSearchParams();
+    if ($("#sop-op").value) params.set("op_code", $("#sop-op").value);
+    if ($("#sop-status").value) params.set("status", $("#sop-status").value);
+
+    const [sops, pending, compliance] = await Promise.all([
+      api(`/api/sops?${params}`),
+      api("/api/sops/pending"),
+      api("/api/sops/compliance"),
+    ]);
+
+    renderTable("#t-sops", [
+      { title: "代碼", render: (r) => `<a href="#" data-sop="${esc(r.sop_code)}" data-ver="${r.version}">${esc(r.sop_code)}</a>` },
+      { title: "版本", num: true, render: (r) => `v${r.version}` },
+      { title: "標題", key: "title" },
+      { title: "站別", key: "op_code" },
+      { title: "狀態", render: (r) => `<span class="tag ${SOP_STATUS_TAG[r.status] || ""}">${esc(SOP_STATUS_LABEL[r.status] || r.status)}</span>` },
+      { title: "步驟", key: "step_count", num: true },
+      { title: "生效", render: (r) => when(r.effective_from) },
+    ], sops, "尚無作業指導書");
+
+    $("#t-sops").querySelectorAll("a[data-sop]").forEach((link) => {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        showSop(link.dataset.sop, link.dataset.ver);
+      });
+    });
+    if (sops.length) showSop(sops[0].sop_code, sops[0].version);
+
+    renderTable("#t-sop-pending", [
+      { title: "代碼", key: "sop_code" },
+      { title: "版本", num: true, render: (r) => `v${r.version}` },
+      { title: "標題", key: "title" },
+      { title: "站別", key: "op_code" },
+      { title: "", render: (r) => `<button class="btn small" data-ack="${esc(r.sop_code)}" data-ver="${r.version}">簽認</button>` },
+    ], pending, "已全部簽認完畢");
+    bindAckButtons("#t-sop-pending");
+
+    renderTable("#t-sop-compliance", [
+      { title: "代碼", key: "sop_code" },
+      { title: "版本", num: true, render: (r) => `v${r.version}` },
+      { title: "站別", key: "op_code" },
+      { title: "已簽認", num: true, render: (r) => `${num(r.acknowledged)} / ${num(r.target_headcount)}` },
+      { title: "簽認率", num: true, render: (r) => barCell(r.rate, r.rate >= 1 ? "ok" : r.rate >= 0.6 ? "warn" : "bad") },
+    ], compliance, "沒有需要簽認的 SOP");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+async function showSop(sopCode, version) {
+  try {
+    const sop = await api(`/api/sops/${encodeURIComponent(sopCode)}?version=${version}`);
+    $("#sop-title").textContent = `${sop.sop_code} v${sop.version}｜${sop.op_code}`;
+    const steps = (sop.steps || []).map((s) => `
+      <li><b>${esc(s.instruction)}</b>
+        ${s.detail ? `<div class="muted">${esc(s.detail)}</div>` : ""}
+        ${s.checkpoint ? `<div class="muted">檢查點：${esc(s.checkpoint)}</div>` : ""}
+      </li>`).join("");
+    $("#sop-detail").innerHTML = `
+      <div style="margin-bottom:10px">${esc(sop.summary || "")}</div>
+      <ol style="margin-left:18px;line-height:1.9">${steps || "<li class='muted'>尚無步驟</li>"}</ol>
+      ${sop.hazards ? `<div style="margin-top:12px"><b>風險：</b>${esc(sop.hazards)}</div>` : ""}
+      ${(sop.ppe || []).length ? `<div style="margin-top:6px"><b>防護具：</b>${sop.ppe.map((p) => `<span class="tag">${esc(p)}</span>`).join(" ")}</div>` : ""}
+      <div style="margin-top:14px">
+        <button class="btn primary" data-ack="${esc(sop.sop_code)}" data-ver="${sop.version}">我已閱讀並簽認</button>
+      </div>`;
+    bindAckButtons("#sop-detail");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+function bindAckButtons(scope) {
+  $(scope).querySelectorAll("button[data-ack]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        const data = await api("/api/sops/acknowledge", {
+          method: "POST",
+          body: { sop_code: btn.dataset.ack, version: Number(btn.dataset.ver) },
+        });
+        toast(data.already_acknowledged ? "此版本先前已簽認" : `已簽認 ${data.sop_code} v${data.version}`, "ok");
+        loadSops();
+      } catch (err) { toast(err.message, "err"); }
+    });
+  });
+}
+
+/* ── ERP 介接 ────────────────────────────────────────── */
+const ERP_STATUS_TAG = {
+  PENDING: "WAITING", PROCESSED: "RUNNING", ACKED: "RUNNING",
+  SENT: "SCHEDULED_DOWN", FAILED: "HOLD",
+};
+const ERP_DOC_LABEL = {
+  CUSTOMER: "客戶主檔", DEVICE: "產品料號", MATERIAL: "材料主檔", WORK_ORDER: "生產訂單",
+  PRODUCTION_REPORT: "完工回報", MATERIAL_ISSUE: "材料領用", SHIPMENT: "出貨", SCRAP: "報廢",
+};
+
+$("#erp-refresh").addEventListener("click", loadErp);
+
+$("#erp-process").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/erp/inbound/process", { method: "POST", body: { limit: 100 } });
+    toast(`處理 ${data.picked} 筆：成功 ${data.processed}、失敗 ${data.failed}`, data.failed ? "warn" : "ok");
+    loadErp();
+  } catch (err) { toast(err.message, "err"); }
+});
+
+$("#erp-build").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/erp/outbound/build", { method: "POST", body: { hours: 24 } });
+    toast(`已彙整 ${data.total} 張待送單據`, "ok");
+    loadErp();
+  } catch (err) { toast(err.message, "err"); }
+});
+
+$("#erp-doc-type").addEventListener("change", loadErp);
+
+$("#erp-export").addEventListener("click", async () => {
+  const docType = $("#erp-doc-type").value;
+  if (!docType) { toast("請先選擇要匯出的單據類型", "err"); return; }
+  try {
+    // CSV 端點需要 Bearer 標頭，不能直接開新視窗下載
+    const res = await fetch(`/api/erp/outbound/export.csv?doc_type=${docType}`, {
+      headers: { Authorization: `Bearer ${state.token}` },
+    });
+    if (!res.ok) throw new Error(`匯出失敗（HTTP ${res.status}）`);
+    const url = URL.createObjectURL(await res.blob());
+    const link = el("a", { href: url, download: `${docType.toLowerCase()}.csv` });
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) { toast(err.message, "err"); }
+});
+
+async function loadErp() {
+  try {
+    const docType = $("#erp-doc-type").value;
+    const [summary, inbound, outbound] = await Promise.all([
+      api("/api/erp/summary"),
+      api("/api/erp/inbound?limit=100"),
+      api(`/api/erp/outbound?limit=100${docType ? `&doc_type=${docType}` : ""}`),
+    ]);
+    $("#erp-kpis").innerHTML = [
+      { label: "下行待處理", value: num(summary.inbound_pending), foot: "等待套用到 MES", kind: summary.inbound_pending ? "warn" : "ok" },
+      { label: "下行失敗", value: num(summary.inbound_failed), foot: "需人工處理", kind: summary.inbound_failed ? "bad" : "ok" },
+      { label: "上行待送", value: num(summary.outbound_pending), foot: "等待 ERP 取件", kind: summary.outbound_pending ? "warn" : "ok" },
+      { label: "本頁上行單據", value: num(outbound.length), foot: docType ? ERP_DOC_LABEL[docType] : "全部類型（最多 100 筆）" },
+    ].map((c) => `
+      <div class="kpi">
+        <div class="label">${esc(c.label)}</div>
+        <div class="value ${c.kind || ""}">${esc(String(c.value))}</div>
+        <div class="foot">${esc(c.foot)}</div>
+      </div>`).join("");
+
+    renderTable("#t-erp-in", [
+      { title: "ERP 單號", key: "external_id" },
+      { title: "類型", render: (r) => esc(ERP_DOC_LABEL[r.doc_type] || r.doc_type) },
+      { title: "通道", key: "source" },
+      { title: "狀態", render: (r) => `<span class="tag ${ERP_STATUS_TAG[r.status] || ""}">${esc(r.status)}</span>` },
+      { title: "重試", key: "attempts", num: true },
+      { title: "訊息", render: (r) => esc(r.error || r.result?.key || "-") },
+      { title: "收單時間", render: (r) => when(r.received_at) },
+      { title: "", render: (r) => (r.status === "FAILED" ? `<button class="btn small" data-retry="${r.id}">重試</button>` : "") },
+    ], inbound, "沒有下行單據");
+
+    $("#t-erp-in").querySelectorAll("button[data-retry]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await api(`/api/erp/inbound/${btn.dataset.retry}/retry`, { method: "POST" });
+          toast("已排入重試", "ok");
+          loadErp();
+        } catch (err) { toast(err.message, "err"); }
+      });
+    });
+
+    renderTable("#t-erp-out", [
+      { title: "類型", render: (r) => esc(ERP_DOC_LABEL[r.doc_type] || r.doc_type) },
+      { title: "來源單號", key: "reference" },
+      { title: "狀態", render: (r) => `<span class="tag ${ERP_STATUS_TAG[r.status] || ""}">${esc(r.status)}</span>` },
+      { title: "建立時間", render: (r) => when(r.created_at) },
+      { title: "送出", render: (r) => when(r.sent_at) },
+      { title: "回覆", render: (r) => when(r.acked_at) },
+    ], outbound, "沒有上行單據");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+/* ── SECS/GEM ────────────────────────────────────────── */
+const SECS_STATE_TAG = {
+  SELECTED: "RUNNING", CONNECTED: "WAITING",
+  NOT_CONNECTED: "NON_SCHEDULED", DISCONNECTED: "HOLD",
+};
+const SECS_ACTION_LABEL = {
+  EQ_STATE: "更新設備狀態", TRACK_OUT_READY: "提示可出站",
+  ALARM: "轉非計畫停機", LOG_ONLY: "只留紀錄",
+};
+
+$("#secs-refresh").addEventListener("click", loadSecs);
+
+$("#secs-simulate").addEventListener("click", async () => {
+  const eqId = $("#secs-eq").value;
+  const ceid = $("#secs-ceid").value.trim();
+  if (!eqId || !ceid) { toast("請選擇設備並輸入 CEID", "err"); return; }
+  try {
+    const data = await api(`/api/secs/links/${encodeURIComponent(eqId)}/simulate-event`, {
+      method: "POST", body: { ceid: Number(ceid), data_id: 0, reports: [] },
+    });
+    $("#secs-out").textContent = JSON.stringify(data, null, 2);
+    const matched = data.actions?.matched;
+    toast(matched ? `已套用規則：${data.actions.rule}` : "查無對應規則，僅留下紀錄", matched ? "ok" : "warn");
+    loadSecs();
+  } catch (err) { toast(err.message, "err"); }
+});
+
+$("#secs-decode").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/secs/decode", { method: "POST", body: { hex: $("#secs-hex").value.trim() } });
+    $("#secs-out").textContent = `${data.name}\n\n${data.sml}\n\n${JSON.stringify(data.python, null, 2)}`;
+  } catch (err) { $("#secs-out").textContent = err.message; toast(err.message, "err"); }
+});
+
+async function loadSecs() {
+  try {
+    const [status, rules, messages] = await Promise.all([
+      api("/api/secs/status"),
+      api("/api/secs/rules"),
+      api("/api/secs/messages?limit=100"),
+    ]);
+
+    if ($("#secs-eq").options.length <= 1) {
+      status.links.forEach((l) =>
+        $("#secs-eq").appendChild(el("option", { value: l.eq_id }, `${l.eq_id} ${l.eq_name || ""}`)));
+    }
+
+    $("#secs-kpis").innerHTML = [
+      { label: "已設定設備", value: num(status.total), foot: "HSMS 連線" },
+      { label: "已連線", value: num(status.selected), foot: "SELECTED 狀態", kind: status.selected ? "ok" : "" },
+      { label: "未連線", value: num(status.disconnected), foot: "含停用中", kind: status.disconnected ? "warn" : "ok" },
+      { label: "近一小時訊息", value: num(status.links.reduce((s, l) => s + l.messages_last_hour, 0)), foot: "收發合計" },
+    ].map((c) => `
+      <div class="kpi">
+        <div class="label">${esc(c.label)}</div>
+        <div class="value ${c.kind || ""}">${esc(String(c.value))}</div>
+        <div class="foot">${esc(c.foot)}</div>
+      </div>`).join("");
+
+    renderTable("#t-secs-links", [
+      { title: "設備", render: (r) => `${esc(r.eq_id)}<br><span class="muted" style="font-size:12px">${esc(r.eq_name || "")}</span>` },
+      { title: "位址", render: (r) => `${esc(r.host)}:${r.port}` },
+      { title: "連線狀態", render: (r) => `<span class="tag ${SECS_STATE_TAG[r.connection_state] || ""}">${esc(r.connection_state)}</span>` },
+      { title: "啟用", render: (r) => (r.enabled ? "是" : "否") },
+      { title: "近一小時訊息", key: "messages_last_hour", num: true },
+      { title: "最後訊息", render: (r) => when(r.last_message_at) },
+      { title: "", render: (r) => `<button class="btn small" data-conn="${esc(r.eq_id)}" data-on="${r.connection_state === "SELECTED" ? 0 : 1}">${r.connection_state === "SELECTED" ? "中斷" : "連線"}</button>` },
+    ], status.links, "尚未設定任何設備連線");
+
+    $("#t-secs-links").querySelectorAll("button[data-conn]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const action = btn.dataset.on === "1" ? "connect" : "disconnect";
+        try {
+          await api(`/api/secs/links/${encodeURIComponent(btn.dataset.conn)}/${action}`, { method: "POST" });
+          toast(action === "connect" ? "已開始連線，請稍候重新整理" : "已中斷連線", "ok");
+          loadSecs();
+        } catch (err) { toast(err.message, "err"); }
+      });
+    });
+
+    renderTable("#t-secs-rules", [
+      { title: "CEID", key: "ceid", num: true },
+      { title: "名稱", key: "name" },
+      { title: "適用設備", render: (r) => esc(r.eq_id || "全部") },
+      { title: "動作", render: (r) => esc(SECS_ACTION_LABEL[r.action] || r.action) },
+      { title: "參數", render: (r) => `<code>${esc(JSON.stringify(r.params || {}))}</code>` },
+      { title: "啟用", render: (r) => (r.enabled ? "是" : "否") },
+    ], rules, "尚未設定事件規則");
+
+    renderTable("#t-secs-msgs", [
+      { title: "時間", render: (r) => when(r.timestamp) },
+      { title: "設備", key: "eq_id" },
+      { title: "方向", render: (r) => `<span class="tag ${r.direction === "RECV" ? "WAITING" : "COMPLETED"}">${r.direction === "RECV" ? "收" : "送"}</span>` },
+      { title: "訊息", render: (r) => `<a href="#" data-msg="${r.id}">S${r.stream}F${r.function}${r.w_bit ? " W" : ""}</a>` },
+      { title: "說明", key: "description" },
+    ], messages, "尚無 SECS 訊息");
+
+    const byId = Object.fromEntries(messages.map((m) => [String(m.id), m]));
+    $("#t-secs-msgs").querySelectorAll("a[data-msg]").forEach((link) => {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        const msg = byId[link.dataset.msg];
+        $("#secs-out").textContent =
+          `S${msg.stream}F${msg.function}${msg.w_bit ? " W" : ""}｜${msg.direction}｜${when(msg.timestamp)}\n\n` +
+          `${msg.sml || "（無內容）"}`;
+      });
+    });
   } catch (err) { toast(err.message, "err"); }
 }
 

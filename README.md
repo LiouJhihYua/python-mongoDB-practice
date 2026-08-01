@@ -2,7 +2,8 @@
 
 以 **Python (FastAPI) + PostgreSQL** 實作，針對 **OSAT（Outsourced Semiconductor Assembly and Test，封裝測試代工廠）** 的作業特性設計的製造執行系統。
 
-涵蓋從**晶圓進料 → 切割 → 黏晶 → 打線 → 封膠 → 印字 → 植球 → 切單 → 外觀檢 → 最終測試 → 編帶包裝 → 出貨**的完整生產管理，含 WIP 追蹤、生產派工、良率分析、SPC 統計製程管制、設備 OEE、治具壽命、Q-Time 管制與正逆向追溯。
+涵蓋從**晶圓進料 → 切割 → 黏晶 → 打線 → 封膠 → 印字 → 植球 → 切單 → 外觀檢 → 最終測試 → 編帶包裝 → 出貨**的完整生產管理，含 WIP 追蹤、生產派工、良率分析、SPC 統計製程管制、設備 OEE、治具壽命、Q-Time 管制與正逆向追溯；
+並整合**晶圓 Map 與 die 級追溯、e-SOP 電子作業指導書、ERP 收發介接、SECS/GEM 設備連線**四大現場整合模組。
 
 **整套技術堆疊都採寬鬆開源授權，可自行部署在廠內，無授權費用、無使用範圍限制。**
 
@@ -109,11 +110,43 @@ SEMI E10 狀態機與狀態履歷、稼動率／OEE 計算、PM 保養工單（�
 
 ### 追溯
 ```
-晶圓 → 批號（含拆批／併批族譜）→ 加工履歷（設備／人員／時間）→ 材料批 → 出貨單 → 客戶
+晶粒座標 → 成品序號 → 批號（含拆批／併批族譜）→ 加工履歷（設備／人員／時間）→ 材料批 → 出貨單 → 客戶
 ```
 - **逆向追溯**：客訴進來時，查這批貨用了哪些晶圓、上了哪些機台、誰做的、用了哪批材料
 - **正向追溯**：晶圓廠通知某片 wafer 異常時，圈出所有受影響的批號與已出貨客戶
 - **材料流向**：供應商材料批異常時的圈選範圍
+- **die 級追溯**：客戶退回一顆不良品時，直接回推到晶圓上的 (x, y) 與相鄰晶粒的測試結果
+
+### 晶圓 Map 與 die 級追溯
+- Map 上傳支援三種格式：二維陣列、RLE 字串、每行一列的 ASCII 文字檔（晶圓廠常見的交換格式）
+- 儲存採 **Run-Length Encoding 逐列壓縮** —— 一片 12 吋上萬顆晶粒只佔幾 KB，取用時再解回陣列
+- **邊緣良率分析**：以「晶圓外 + 格線外側」為起點做廣度優先搜尋算出每顆晶粒的環數，
+  圓形晶圓的邊緣才會被正確識別；邊緣與中心良率差距過大是晶圓廠邊緣製程異常的典型徵兆
+- **群聚不良分析**：把相連的不良晶粒歸成一群。大面積群聚代表製程／機台問題（刮傷、微粒、光罩缺陷），
+  散落的單點多半是隨機不良 —— 兩者的改善方向完全不同
+- **die → unit 綁定**：黏晶是晶粒失去座標的那一刻，綁定必須在這裡完成
+- **CP / FT 對照**：找出「CP 過、FT 掛」的晶粒分布，回答 OSAT 最常被問的那句話 —— 這是封裝做壞的，還是晶圓本來就不好
+
+### e-SOP 電子作業指導書
+- 版本控制、生效日與作廢；改版可由現行版本複製出草稿，不必重打
+- 依**站別 + 料號**自動挑適用版本，料號專用版優先於通用版
+- 作業員線上簽認；站別設定 `require_sop_ack` 後，**未簽認新版就進不了站**
+- 簽認率報表 —— 客戶稽核時要交出來的那張表
+
+### ERP 介接
+- 「收發交易表 + 冪等鍵 + 重試」，兩邊不直接互打資料庫
+- **下行（ERP → MES）**：客戶／料號／材料／生產訂單。`(doc_type, external_id)` 唯一，重送不會重複建檔；
+  每筆單據跑在自己的交易裡，一筆失敗不會拖垮整批，失敗原因寫回該筆供現場查修
+- **上行（MES → ERP）**：完工回報、材料領用、出貨、報廢。支援 ERP 拉單、ACK 回覆與重新排隊
+- REST 與 CSV 雙通道 —— 現場真的還有很多 ERP 只吃檔案
+
+### SECS/GEM 設備連線
+- **SECS-II 項目編解碼**（SEMI E5）：List / ASCII / Binary / Boolean / 各長度整數與浮點數，含 SML 呈現
+- **HSMS-SS**（SEMI E37）：Select、Linktest、Separate 控制訊息與 T3 / T5 / T6 計時器，斷線自動重連
+- **GEM 主機**：S1F1、S1F13、S5F1（警報）、S6F11（事件報告）；未實作的訊息一律回 SxF0，不讓對方乾等
+- **事件對應規則**：CEID → 更新設備 E10 狀態／提示可出站／轉非計畫停機／只留紀錄，可依設備覆寫，
+  同一套 MES 就能對付不同廠牌的機台
+- **內附設備模擬器**（`python -m scripts.eqsim`）：沒有實機也能把整條路徑跑完
 
 ---
 
@@ -129,15 +162,22 @@ app/
 ├── errors.py                商業邏輯例外 → HTTP 狀態碼
 ├── models/                  Pydantic 模型與 OSAT 領域列舉
 ├── services/                商業邏輯（進出站、拆併批、OEE、SPC、派工、治具、追溯、報表…）
+│   ├── wafermap_service.py  晶圓 Map（RLE 壓縮、邊緣／群聚分析、die 綁定與追溯）
+│   ├── sop_service.py       e-SOP 版本控制、適用版本查詢、簽認管制
+│   ├── erp_service.py       ERP 收發交易表、冪等與重試、CSV 通道
+│   ├── secs.py              SECS-II / HSMS 協定編解碼（純函式，不碰資料庫）
+│   ├── secs_client.py       HSMS-SS 用戶端（計時器、Linktest、自動重連）
+│   └── secs_service.py      GEM 主機邏輯與 CEID → MES 動作對應
 ├── routers/                 HTTP API
 └── static/                  戰情看板前端（原生 JS，無需建置）
 
 scripts/
-├── seed.py                  建立示範主檔（客戶／料號／流程／設備／不良碼／量測項目／治具／晶圓）
-├── simulate.py              離散時間模擬產線跑批，含 SPC 量測、製程漂移與換刀
+├── seed.py                  建立示範主檔（含晶圓 Map、e-SOP、SECS 規則與 ERP 單據）
+├── simulate.py              離散時間模擬產線跑批，含 SPC 量測、製程漂移、換刀與 die 綁定
+├── eqsim.py                 SECS/GEM 設備模擬器（HSMS-SS Passive）
 └── demo.py                  一鍵展示：內嵌 PostgreSQL + 主檔 + 模擬 + 網頁
 
-tests/                       148 個測試，涵蓋規則、狀態機、SPC 數學、報表與 API
+tests/                       267 個測試，涵蓋規則、狀態機、SPC 數學、協定編解碼、報表與 API
 ```
 
 ### 分層原則
@@ -179,6 +219,17 @@ docker compose up -d --build
 docker compose exec api python -m scripts.seed
 ```
 
+### 連線一台（模擬的）機台
+
+沒有實機也能把 SECS/GEM 整條路徑跑完 —— 另開一個終端機啟動設備模擬器：
+
+```bash
+python -m scripts.eqsim --port 5001 --eq-id WB-01
+```
+
+再到「SECS/GEM」頁面把 `WB-01` 的埠設為 5001、按「連線」。
+連上之後模擬器會週期性送出事件報告與警報，MES 會依事件規則自動更新設備狀態。
+
 ---
 
 ## 設定項目
@@ -196,6 +247,7 @@ docker compose exec api python -m scripts.seed
 | `MES_TZ_OFFSET_HOURS` | `8` | 廠區時區，影響班別與日報切分 |
 | `MES_SHIFT_START_HOURS` | `[8,20]` | 班別起始時間 |
 | `MES_AUTO_HOLD_ON_QTIME_VIOLATION` | `true` | Q-Time 逾時是否自動扣留 |
+| `MES_SECS_AUTOSTART` | `false` | 啟動時是否自動連線所有啟用中的設備（開發／測試建議關閉） |
 
 ---
 
@@ -242,6 +294,19 @@ docker compose exec api python -m scripts.seed
 | `GET` | `/api/quality/defects/pareto` | 不良柏拉圖 |
 | `GET` | `/api/trace/lots/{lot}/backward` | 逆向追溯 |
 | `GET` | `/api/trace/wafers/{wafer}/forward` | 正向追溯 |
+| `POST` | `/api/wafer/maps` | 上傳晶圓 Map（grid / RLE / 文字三選一） |
+| `GET` | `/api/wafer/maps/{wafer}/analysis` | 邊緣良率與群聚不良分析 |
+| `POST` | `/api/wafer/dies/assign` | 綁定良品晶粒到批號成品序號 |
+| `GET` | `/api/wafer/lots/{lot}/units/{seq}` | 成品序號 → 晶圓座標（die 級追溯） |
+| `GET` | `/api/wafer/maps/{wafer}/area` | 圈選晶圓區域，列出受影響批號 |
+| `GET` | `/api/sops/station/{op}` | 站別適用的 SOP 與我的簽認狀態 |
+| `POST` | `/api/sops/{code}/{ver}/release` · `/api/sops/acknowledge` | 發行版本／作業員簽認 |
+| `POST` | `/api/erp/inbound` · `/inbound/process` | 接收 ERP 單據／套用到 MES |
+| `POST` | `/api/erp/outbound/build` · `/outbound/fetch` · `/outbound/ack` | 彙整／拉單／回覆 |
+| `GET` | `/api/erp/outbound/export.csv` | 上行單據匯出 CSV |
+| `PUT` | `/api/secs/links/{eq}` · `/api/secs/rules` | 設備連線參數／事件對應規則 |
+| `POST` | `/api/secs/links/{eq}/connect` · `/command` · `/simulate-event` | 連線／遠端指令／模擬事件 |
+| `POST` | `/api/secs/decode` | 解析 HSMS 十六進位訊息 |
 | `GET` | `/api/audit` | 稽核軌跡（管理者／品保） |
 
 完整規格見 `/docs`（Swagger UI）。
@@ -291,6 +356,33 @@ SPC 在加工途中判異會扣留批號，但料還在機台上——若連出�
 **時間來源可注入。**
 `app.models.base.set_clock()` 讓模擬器與測試可以推進虛擬時間，才能測出 Q-Time、週期時間與 OEE 這類與時間強相關的邏輯。
 
+**晶圓 Map 逐列 RLE 壓縮，而不是一顆晶粒一列。**
+一片 12 吋晶圓上萬顆晶粒，逐顆存成資料列會讓資料庫爆掉。改以每列 `"bin:count,…"` 存進 JSONB，
+一張完整的 map 只佔幾 KB，取用時再解回二維陣列；只有真正被綁定到成品的晶粒才進 `die_assignments`。
+
+**邊緣良率用 BFS 算環數，不是看矩形的四個邊。**
+晶圓是圓的，用矩形邊界判斷「邊緣晶粒」會把圓弧上的一大片誤判成中心。
+以「所有非晶粒位置 + 格線外側」為多重起點做廣度優先搜尋，每顆晶粒才會拿到正確的環號。
+
+**die 綁定放在黏晶站。**
+黏晶是晶粒失去座標的那一刻，之後任何一顆成品都只剩下批號。綁定必須在這一站完成，
+客戶退回一顆不良品時才回推得到晶圓上的 (x, y)。上傳過 Map 的晶圓一旦有晶粒被綁定就不可覆蓋或刪除 Map。
+
+**e-SOP 的適用版本由「站別 + 料號」決定，料號專用版優先。**
+現場終端機開站時只問「這一站、這個料號，現在該照哪一版做」——版本挑選是系統的責任，不是作業員的。
+
+**ERP 介接只走單據，不共用資料庫。**
+兩邊各有自己的狀態機，直接互打資料庫會把彼此的交易邊界綁死。單據先落地收發交易表，
+以 `(doc_type, external_id)` 做冪等鍵擋重送，每筆各自跑一個交易——一筆失敗不會拖垮整批。
+
+**SECS 協定層與資料庫完全分離。**
+`secs.py` 只做「位元組 ↔ Python 結構」的轉換，因此能被單獨測試，也能直接餵給設備模擬器重複使用；
+連線狀態與訊息記錄才落到資料庫。未實作的訊息一律回 SxF0（Abort），不能讓機台等到 T3 逾時。
+
+**設備事件對應規則存在資料表，不寫死在程式裡。**
+不同廠牌機台的 CEID 天差地遠。規則以「CEID → MES 動作」存放並可依設備覆寫，
+換一台機台只要加一筆規則，不必改程式。
+
 ---
 
 ## 測試
@@ -306,7 +398,7 @@ python -m pytest
 MES_TEST_DATABASE_URL=postgresql://user@localhost:5432/mes_test python -m pytest
 ```
 
-148 個測試，涵蓋：
+267 個測試，涵蓋：
 - 密碼／JWT／RBAC 與越權存取
 - 主檔參照完整性與流程版本管理
 - 單位換算、數量結平、不良明細一致性
@@ -319,6 +411,11 @@ MES_TEST_DATABASE_URL=postgresql://user@localhost:5432/mes_test python -m pytest
 - 派工排序（Q-Time 插隊優先於急單）與 Q-Time 預警
 - 稽核遮蔽、班別區間換算與交接班報表
 - WIP、良率、柏拉圖、Bin 分佈、週期時間、看板彙總
+- 晶圓 Map 的 RLE 編解碼、邊緣良率、群聚分析、die 綁定與雙向追溯
+- e-SOP 版本控制、生效日、簽認管制與「未簽認擋進站」
+- ERP 收發的冪等、失敗重試、CSV 匯入匯出與拉單／ACK 流程
+- SECS-II 項目與 HSMS 訊息編解碼、串流切包、GEM 訊息處理與事件對應
+- 與設備模擬器的端對端連線（Select → S1F1 → 設備主動送事件 → MES 改設備狀態）
 - HTTP 層完整動線與錯誤回應格式
 
 ---
@@ -328,4 +425,9 @@ MES_TEST_DATABASE_URL=postgresql://user@localhost:5432/mes_test python -m pytest
 - SPC 管制界限目前在累積足夠子群後自動建立一次；正式使用時應由製程工程師確認基準期是否穩定，必要時以 `establish_limits` 重新建立。
 - `scrap_qty` 累計的是「不良發生當下的單位數量」；批號跨越單位換算站時，此欄位是混合單位的累計值，精確的分站不良數請看 `lot_history` 或不良報表。
 - 資料表結構由 `schema.sql` 在啟動時以 `CREATE TABLE IF NOT EXISTS` 建立，適合初期開發；正式環境上線後建議導入 migration 工具（如 Alembic 或 sqitch）管理結構變更。
-- 尚未實作：晶圓 Map（Die 級座標追溯）、與 ERP／設備 SECS/GEM 的整合介面、e-SOP 作業指導書。
+- die 級追溯逐顆存放成本高，實務上多用於高單價產品或抽樣；系統把綁定做成一支獨立 API，由現場決定哪些批號要開。
+- SECS/GEM 實作的是 GEM 主機側的常用子集（S1F1、S1F13、S2F31、S2F41、S5F1、S6F11）；
+  完整 GEM 還包含配方管理（S7）、Spooling、Terminal Services 等，導入特定機台時需依機台的 GEM 手冊補齊。
+- HSMS 只實作 SS（Single Session）與 ACTIVE 模式；由設備主動連入 MES 的 PASSIVE 模式尚未支援。
+- ERP 上行單據目前採「ERP 端拉單」；若要改為 MES 主動推送，需在 `erp_service` 補上目標端點與重送排程。
+- e-SOP 的附件僅存放連結，檔案本身需另置於檔案伺服器或物件儲存。

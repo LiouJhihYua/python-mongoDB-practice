@@ -31,10 +31,14 @@ from app.models.enums import (  # noqa: E402
 )
 from app.services import (  # noqa: E402
     equipment_service,
+    erp_service,
     lot_service,
     master_service,
+    secs_service,
+    sop_service,
     spc_service,
     tool_service,
+    wafermap_service,
     workorder_service,
 )
 
@@ -92,6 +96,19 @@ async def _users(db) -> dict[str, dict]:
 def _pick_operator(users: dict[str, dict], op_code: str, rng: random.Random) -> dict:
     candidates = [u for u in users.values() if op_code in (u.get("certifications") or [])]
     return rng.choice(candidates) if candidates else users["eng01"]
+
+
+async def _ack_sop(db, op_code: str, device_id: str, username: str) -> None:
+    """作業員簽認該站目前生效的 e-SOP（已簽過會直接回傳原紀錄）。"""
+    doc = await sop_service.applicable_sop(db, op_code, device_id)
+    if doc is None:
+        return
+    try:
+        await sop_service.acknowledge(
+            db, {"sop_code": doc["sop_code"], "version": doc["version"]}, username
+        )
+    except MESError as exc:
+        log.debug("簽認 SOP 略過：%s", exc)
 
 
 async def _free_equipment(db, op_code: str, rng: random.Random) -> dict | None:
@@ -399,6 +416,14 @@ async def _simulate(db, days: int, seed: int) -> None:
     await db.execute(
         "UPDATE wafers SET received_at = $1 WHERE NOT consumed", clock.now - timedelta(days=1)
     )
+    # e-SOP 的生效日同理：晚於模擬起點的話，作業員會被「SOP 尚未生效」擋在站外
+    await db.execute(
+        """
+        UPDATE sops SET effective_from = $1
+        WHERE status = 'RELEASED' AND (effective_from IS NULL OR effective_from > $1)
+        """,
+        clock.now - timedelta(days=1),
+    )
     base_models.set_clock(clock)
     try:
         await _run(db, users, rng, clock, end)
@@ -412,7 +437,8 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
     log.info("建立 %d 張工單、裝上 %d 支治具", len(wo_nos), mounted)
 
     stats = {"track_in": 0, "track_out": 0, "holds": 0, "released": 0,
-             "downs": 0, "shipped": 0, "measured": 0, "tools_changed": 0}
+             "downs": 0, "shipped": 0, "measured": 0, "tools_changed": 0,
+             "dies_bound": 0, "dies_tested": 0}
     drift: dict[tuple, float] = {}
     ticks = 0
     while clock.now < end:
@@ -449,6 +475,11 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
                         stats["tools_changed"] += await _replace_expired_tools(
                             db, result["tool_alerts"], lot["current_op"], rng
                         )
+                    # 黏晶是晶粒失去座標的那一刻，綁定必須在這裡做；FT 再把結果回寫
+                    if lot["current_op"] == "DIE_ATTACH":
+                        stats["dies_bound"] += await _bind_dies(db, lot)
+                    elif lot["current_op"] == "FT":
+                        stats["dies_tested"] += await _report_die_results(db, lot, rng)
                 except MESError as exc:
                     log.debug("出站失敗 %s：%s", lot["lot_id"], exc)
 
@@ -466,6 +497,9 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
                     continue  # 沒機台 → 排隊，Q-Time 開始累積
                 eq_id = eq["eq_id"]
             operator = _pick_operator(users, lot["current_op"], rng)
+            if operation.get("require_sop_ack"):
+                # 現場實務：作業員在終端機讀完當前版本的 e-SOP 才能開站
+                await _ack_sop(db, lot["current_op"], lot["device_id"], operator["username"])
             try:
                 await lot_service.track_in(
                     db, {"lot_id": lot["lot_id"], "eq_id": eq_id, "remark": ""}, operator
@@ -533,6 +567,8 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
 
     # 收尾：示範拆批與併批，讓族譜追溯有東西可看
     await _demo_split_merge(db, users, stats)
+    await _demo_secs_events(db)
+    await _demo_erp_outbound(db, clock, end)
 
     wip = await db.fetchval(
         "SELECT count(*) FROM lots WHERE status = ANY($1::text[])", ACTIVE_STATUSES
@@ -543,6 +579,7 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
         stats["released"], stats["downs"], stats["shipped"],
     )
     log.info("SPC 量測 %d 次 / 換刀 %d 次；目前在製 %d 批", stats["measured"], stats["tools_changed"], wip)
+    log.info("die 綁定 %d 顆 / 回寫測試結果 %d 顆", stats["dies_bound"], stats["dies_tested"])
 
 
 async def _demo_split_merge(db, users: dict, stats: dict) -> None:
@@ -582,6 +619,103 @@ async def _demo_split_merge(db, users: dict, stats: dict) -> None:
             log.info("示範併批：%s → %s", lot_ids, merged["lot_id"])
         except MESError as exc:
             log.debug("併批略過：%s", exc)
+
+
+#: die 級追溯逐顆存放成本高，實務上多用於高單價產品或抽樣；示範每批綁前 N 顆
+DIE_BINDING_UNITS = 200
+
+
+async def _bind_dies(db, lot: dict) -> int:
+    """黏晶出站後，把有 Map 的晶圓上的良品晶粒綁到成品序號。"""
+    wafer_ids = list(lot["wafer_ids"] or [])
+    if not wafer_ids:
+        return 0
+    mapped = [
+        r["wafer_id"] for r in await db.fetch(
+            "SELECT wafer_id, pass_count FROM wafer_maps WHERE wafer_id = ANY($1::text[]) ORDER BY wafer_id",
+            wafer_ids,
+        )
+    ]
+    if not mapped:
+        return 0
+    available = await db.fetchval(
+        "SELECT coalesce(sum(pass_count), 0) - "
+        "(SELECT count(*) FROM die_assignments WHERE wafer_id = ANY($1::text[])) "
+        "FROM wafer_maps WHERE wafer_id = ANY($1::text[])",
+        mapped,
+    )
+    qty = min(DIE_BINDING_UNITS, int(available or 0))
+    if qty <= 0:
+        return 0
+    try:
+        result = await wafermap_service.assign_dies(
+            db, {"lot_id": lot["lot_id"], "qty": qty, "wafer_ids": mapped}, "op001"
+        )
+    except MESError as exc:
+        log.debug("die 綁定略過 %s：%s", lot["lot_id"], exc)
+        return 0
+    return int(result["assigned"])
+
+
+async def _report_die_results(db, lot: dict, rng: random.Random) -> int:
+    """FT 出站後把測試 Bin 回寫到晶粒，完成 die 級良率閉環。"""
+    rows = await db.fetch(
+        "SELECT unit_seq FROM die_assignments WHERE lot_id = $1 AND ft_bin IS NULL ORDER BY unit_seq",
+        lot["lot_id"],
+    )
+    if not rows:
+        return 0
+    results = [
+        {"unit_seq": int(r["unit_seq"]),
+         "ft_bin": 1 if rng.random() > 0.03 else rng.choice([2, 3, 4, 5])}
+        for r in rows
+    ]
+    try:
+        await wafermap_service.record_ft_results(
+            db, {"lot_id": lot["lot_id"], "results": results, "pass_bins": [1]}, "op003"
+        )
+    except MESError as exc:
+        log.debug("die 測試結果回寫略過 %s：%s", lot["lot_id"], exc)
+        return 0
+    return len(results)
+
+
+async def _demo_secs_events(db) -> None:
+    """灌幾筆設備事件，讓 SECS 訊息記錄與規則對應有東西可看。
+
+    只用不會改變設備狀態的事件（LOG_ONLY 與可出站提示），
+    避免模擬出來的 OEE 被這裡的假事件汙染。
+    """
+    eq_ids = [r["eq_id"] for r in await db.fetch("SELECT eq_id FROM secs_links ORDER BY eq_id LIMIT 2")]
+    for eq_id in eq_ids:
+        for ceid in (2005, 2002):
+            try:
+                await secs_service.simulate_event(
+                    db, eq_id, {"ceid": ceid, "data_id": 0,
+                                "reports": [{"rptid": 1, "values": ["DEMO"]}]}, "eng01",
+                )
+            except MESError as exc:
+                log.debug("SECS 事件略過：%s", exc)
+    if eq_ids:
+        log.info("示範 SECS 事件：%s 各 2 則", ", ".join(eq_ids))
+
+
+async def _demo_erp_outbound(db, clock: SimClock, end: datetime) -> None:
+    """把模擬期間的完工、領料、出貨、報廢整理成待送 ERP 的單據。"""
+    try:
+        result = await erp_service.build_outbound(
+            db, {"start": end - timedelta(days=30), "end": clock.now + timedelta(minutes=1)}, "planner01"
+        )
+    except MESError as exc:
+        log.debug("ERP 上行單據略過：%s", exc)
+        return
+    log.info(
+        "ERP 上行單據：完工 %d / 領料 %d / 出貨 %d / 報廢 %d",
+        result["created"].get("PRODUCTION_REPORT", 0),
+        result["created"].get("MATERIAL_ISSUE", 0),
+        result["created"].get("SHIPMENT", 0),
+        result["created"].get("SCRAP", 0),
+    )
 
 
 if __name__ == "__main__":
