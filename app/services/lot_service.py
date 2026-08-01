@@ -44,7 +44,13 @@ from app.models.enums import (
     UnitType,
     WorkOrderStatus,
 )
-from app.services import equipment_service, master_service, material_service, tool_service
+from app.services import (
+    equipment_service,
+    master_service,
+    material_service,
+    sop_service,
+    tool_service,
+)
 from app.services.user_service import is_certified
 
 RUNNABLE_STATES = [s.value for s in RUNNABLE_EQUIPMENT_STATES]
@@ -333,6 +339,9 @@ async def _track_in_tx(db, payload: dict, user: dict) -> tuple[dict | None, Exce
 
         if operation["requires_certification"] and not is_certified(user, op_code):
             raise PermissionError_(f"作業員 {actor} 未取得 {op_code} 站別資格認證")
+        if operation.get("require_sop_ack"):
+            # 站別要求先讀過 e-SOP：沒簽認新版就進不了站
+            await sop_service.ensure_acknowledged(db, op_code, lot["device_id"], actor)
 
         eq = None
         if operation["requires_equipment"]:

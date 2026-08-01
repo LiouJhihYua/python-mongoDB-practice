@@ -97,6 +97,11 @@ async def get_operation(db: DB, op_code: str):
     return await master_service.operations.get(db, op_code)
 
 
+@router.patch("/operations/{op_code}", dependencies=[CanEdit], summary="更新站別（含 e-SOP 簽認要求）")
+async def update_operation(db: DB, op_code: str, payload: dict, user: CurrentUser):
+    return await master_service.operations.update(db, op_code, payload, user["username"])
+
+
 # ── 製程流程 ────────────────────────────────────────────────
 @router.post("/routes", status_code=status.HTTP_201_CREATED, dependencies=[CanEdit], summary="建立製程流程")
 async def create_route(db: DB, payload: RouteIn, user: CurrentUser):

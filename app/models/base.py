@@ -1,6 +1,7 @@
 """共用模型工具：時間、班別、序列化、分頁。"""
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable, Generic, TypeVar
 
@@ -82,6 +83,27 @@ def plain_values(value: Any) -> Any:
         return {k: plain_values(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [plain_values(v) for v in value]
+    return value
+
+
+def json_safe(value: Any) -> Any:
+    """轉成可直接寫入 JSONB 的結構。
+
+    ``plain_values`` 只處理 Enum；要塞進 JSONB 的內容還會出現時間與 Decimal，
+    這兩種 json.dumps 都吃不下，必須先轉成字串／浮點數。
+    """
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return ensure_aware(value).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
     return value
 
 

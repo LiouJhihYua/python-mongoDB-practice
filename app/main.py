@@ -21,18 +21,22 @@ from app.routers import (
     auth,
     dispatch,
     equipment,
+    erp,
     lots,
     master,
     materials,
     quality,
     reports,
+    secs,
+    sop,
     spc,
     tools,
     trace,
+    wafermap,
     workorders,
 )
 from app.security import decode_access_token
-from app.services import audit_service
+from app.services import audit_service, secs_service
 from app.services.user_service import ensure_bootstrap_admin
 
 logging.basicConfig(
@@ -51,6 +55,9 @@ async def lifespan(app: FastAPI):
     await connect_db()
     async with acquire() as conn:
         await ensure_bootstrap_admin(conn)
+        if settings.secs_autostart:
+            started = await secs_service.start_enabled_links(conn)
+            logger.info("已啟動 %d 條 SECS 連線：%s", len(started), ", ".join(started) or "（無）")
     for hook in startup_hooks:
         await hook()
     logger.info(
@@ -58,6 +65,7 @@ async def lifespan(app: FastAPI):
         settings.app_name, settings.app_version, settings.factory_code, settings.db_backend,
     )
     yield
+    await secs_service.manager.stop_all()
     await close_db()
 
 
@@ -66,7 +74,9 @@ app = FastAPI(
     version=settings.app_version,
     description=(
         "涵蓋主檔、工單、批號進出站、拆併批、扣留放行、派工、SPC、設備 OEE、"
-        "治具壽命、品質分析、材料耗用與正逆向追溯的 MES API。"
+        "治具壽命、品質分析、材料耗用與正逆向追溯的 MES API；"
+        "並整合晶圓 Map 與 die 級追溯、e-SOP 電子作業指導書、ERP 收發介接、"
+        "以及 SECS/GEM 設備連線。"
         "後端為 PostgreSQL，全套採寬鬆開源授權。"
     ),
     lifespan=lifespan,
@@ -132,6 +142,7 @@ async def mes_error_handler(request: Request, exc: MESError) -> JSONResponse:
 for module in (
     auth, master, workorders, lots, dispatch, equipment, tools,
     quality, spc, materials, trace, reports, audit,
+    wafermap, sop, erp, secs,
 ):
     app.include_router(module.router)
 

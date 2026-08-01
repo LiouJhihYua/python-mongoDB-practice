@@ -72,6 +72,9 @@ class OperationIn(MESModel):
 
     requires_equipment: bool = True
     requires_certification: bool = False
+    require_sop_ack: bool = Field(
+        default=False, description="進站前必須先簽認該站生效中的 e-SOP"
+    )
     standard_cycle_time_sec: int = Field(default=0, ge=0, description="每批標準加工秒數")
     max_queue_minutes: int = Field(
         default=0, ge=0, description="Q-Time 上限（分鐘），0 表示不管制"

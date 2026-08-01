@@ -184,3 +184,52 @@ class PMStatus(StrEnum):
     IN_PROGRESS = "IN_PROGRESS"
     DONE = "DONE"
     OVERDUE = "OVERDUE"
+
+
+class ERPDocType(StrEnum):
+    """ERP → MES 的下行單據類型。"""
+
+    CUSTOMER = "CUSTOMER"  # 客戶主檔
+    DEVICE = "DEVICE"  # 產品料號主檔
+    MATERIAL = "MATERIAL"  # 材料主檔
+    WORK_ORDER = "WORK_ORDER"  # 生產訂單
+
+
+class ERPOutboundType(StrEnum):
+    """MES → ERP 的上行單據類型。"""
+
+    PRODUCTION_REPORT = "PRODUCTION_REPORT"  # 生產／完工回報
+    MATERIAL_ISSUE = "MATERIAL_ISSUE"  # 材料領用（扣帳）
+    SHIPMENT = "SHIPMENT"  # 出貨（開立發票依據）
+    SCRAP = "SCRAP"  # 報廢（沖銷在製）
+
+
+class ERPInboundStatus(StrEnum):
+    PENDING = "PENDING"
+    PROCESSED = "PROCESSED"
+    FAILED = "FAILED"
+
+
+class ERPOutboundStatus(StrEnum):
+    PENDING = "PENDING"
+    SENT = "SENT"
+    ACKED = "ACKED"
+    FAILED = "FAILED"
+
+
+class SECSConnectionState(StrEnum):
+    """HSMS 連線狀態（SEMI E37）。"""
+
+    NOT_CONNECTED = "NOT_CONNECTED"
+    CONNECTED = "CONNECTED"  # TCP 已通，尚未 Select
+    SELECTED = "SELECTED"  # 已建立 HSMS Session，可收發資料訊息
+    DISCONNECTED = "DISCONNECTED"
+
+
+class SECSEventAction(StrEnum):
+    """收到設備事件（CEID）後 MES 要做的事。"""
+
+    EQ_STATE = "EQ_STATE"  # 更新設備 E10 狀態
+    TRACK_OUT_READY = "TRACK_OUT_READY"  # 加工結束，提示可出站
+    ALARM = "ALARM"  # 設備異常，轉非計畫停機
+    LOG_ONLY = "LOG_ONLY"  # 只留紀錄

@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     # 逾時未進站（Q-Time）超限時是否自動 Hold 批號
     auto_hold_on_qtime_violation: bool = True
 
+    # ── SECS/GEM ────────────────────────────────────────────
+    # 服務啟動時是否自動連線所有啟用中的設備（開發／測試建議關閉）
+    secs_autostart: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:

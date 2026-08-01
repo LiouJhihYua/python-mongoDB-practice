@@ -501,3 +501,165 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 CREATE INDEX IF NOT EXISTS ix_audit_time ON audit_logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS ix_audit_actor_time ON audit_logs (actor, timestamp DESC);
+
+-- ══════════════════════════════════════════════════════════
+--  晶圓 Map 與 Die 級追溯
+-- ══════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS wafer_maps (
+    wafer_id    TEXT PRIMARY KEY REFERENCES wafers(wafer_id),
+    source      TEXT NOT NULL DEFAULT 'CP',            -- CP / AOI / FT
+    rows        INTEGER NOT NULL CHECK (rows > 0),
+    cols        INTEGER NOT NULL CHECK (cols > 0),
+    origin      TEXT NOT NULL DEFAULT 'UPPER_LEFT',
+    notch       TEXT NOT NULL DEFAULT 'DOWN',
+    null_bin    INTEGER NOT NULL DEFAULT -1,           -- 晶圓外／無晶粒的位置
+    pass_bins   INTEGER[] NOT NULL DEFAULT '{1}',
+    die_count   INTEGER NOT NULL DEFAULT 0,            -- 實際存在的晶粒數
+    pass_count  INTEGER NOT NULL DEFAULT 0,
+    bin_counts  JSONB NOT NULL DEFAULT '{}',
+    -- 每一列以 Run-Length Encoding 存成 "bin:count,bin:count,…"，
+    -- 一片 12 吋晶圓上萬顆晶粒也只佔幾 KB
+    rle         JSONB NOT NULL,
+    remark      TEXT NOT NULL DEFAULT '',
+    uploaded_by TEXT NOT NULL DEFAULT 'system',
+    uploaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS die_assignments (
+    id          BIGSERIAL PRIMARY KEY,
+    lot_id      TEXT NOT NULL,
+    unit_seq    INTEGER NOT NULL CHECK (unit_seq > 0), -- 該批內的第幾顆成品
+    wafer_id    TEXT NOT NULL REFERENCES wafers(wafer_id),
+    die_x       INTEGER NOT NULL,
+    die_y       INTEGER NOT NULL,
+    cp_bin      INTEGER,
+    ft_bin      INTEGER,
+    status      TEXT NOT NULL DEFAULT 'ASSIGNED',      -- ASSIGNED / PASS / FAIL / SCRAPPED
+    assigned_by TEXT NOT NULL DEFAULT 'system',
+    assigned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (lot_id, unit_seq),
+    UNIQUE (wafer_id, die_x, die_y)
+);
+CREATE INDEX IF NOT EXISTS ix_die_lot ON die_assignments (lot_id);
+CREATE INDEX IF NOT EXISTS ix_die_wafer ON die_assignments (wafer_id);
+
+-- ══════════════════════════════════════════════════════════
+--  e-SOP 電子作業指導書
+-- ══════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS sops (
+    sop_code       TEXT NOT NULL,
+    version        INTEGER NOT NULL CHECK (version > 0),
+    title          TEXT NOT NULL,
+    op_code        TEXT NOT NULL REFERENCES operations(op_code),
+    device_id      TEXT NOT NULL DEFAULT '',           -- 空字串 = 全料號適用
+    summary        TEXT NOT NULL DEFAULT '',
+    steps          JSONB NOT NULL DEFAULT '[]',
+    hazards        TEXT NOT NULL DEFAULT '',
+    ppe            TEXT[] NOT NULL DEFAULT '{}',       -- 應穿戴的防護具
+    attachments    JSONB NOT NULL DEFAULT '[]',
+    status         TEXT NOT NULL DEFAULT 'DRAFT',      -- DRAFT / RELEASED / OBSOLETE
+    effective_from TIMESTAMPTZ,
+    require_ack    BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by     TEXT NOT NULL DEFAULT 'system',
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by     TEXT,
+    released_by    TEXT,
+    released_at    TIMESTAMPTZ,
+    PRIMARY KEY (sop_code, version)
+);
+CREATE INDEX IF NOT EXISTS ix_sops_op ON sops (op_code, status);
+
+CREATE TABLE IF NOT EXISTS sop_acknowledgements (
+    id              BIGSERIAL PRIMARY KEY,
+    sop_code        TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    username        TEXT NOT NULL,
+    acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (sop_code, version, username)
+);
+CREATE INDEX IF NOT EXISTS ix_sopack_user ON sop_acknowledgements (username);
+
+-- ══════════════════════════════════════════════════════════
+--  ERP 介接（收發交易表）
+-- ══════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS erp_inbound (
+    id           BIGSERIAL PRIMARY KEY,
+    external_id  TEXT NOT NULL,                        -- ERP 端的單號，用來做冪等
+    doc_type     TEXT NOT NULL,                        -- CUSTOMER / DEVICE / WORK_ORDER / MATERIAL
+    payload      JSONB NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'PENDING',      -- PENDING / PROCESSED / FAILED
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    result       JSONB,
+    source       TEXT NOT NULL DEFAULT 'REST',         -- REST / FILE
+    received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at TIMESTAMPTZ,
+    UNIQUE (doc_type, external_id)
+);
+CREATE INDEX IF NOT EXISTS ix_erpin_status ON erp_inbound (status, received_at);
+
+CREATE TABLE IF NOT EXISTS erp_outbound (
+    id         BIGSERIAL PRIMARY KEY,
+    doc_type   TEXT NOT NULL,                          -- PRODUCTION_REPORT / MATERIAL_ISSUE / SHIPMENT / SCRAP
+    reference  TEXT NOT NULL,                          -- lot_id / shipment_no …
+    payload    JSONB NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'PENDING',        -- PENDING / SENT / ACKED / FAILED
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    error      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at    TIMESTAMPTZ,
+    acked_at   TIMESTAMPTZ,
+    UNIQUE (doc_type, reference)
+);
+CREATE INDEX IF NOT EXISTS ix_erpout_status ON erp_outbound (status, created_at);
+
+-- ══════════════════════════════════════════════════════════
+--  SECS/GEM 設備連線
+-- ══════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS secs_links (
+    eq_id             TEXT PRIMARY KEY REFERENCES equipments(eq_id),
+    host              TEXT NOT NULL DEFAULT '127.0.0.1',
+    port              INTEGER NOT NULL DEFAULT 5000,
+    session_id        INTEGER NOT NULL DEFAULT 0,
+    mode              TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE：由 MES 主動連線
+    t3_timeout_sec    INTEGER NOT NULL DEFAULT 45,
+    t5_timeout_sec    INTEGER NOT NULL DEFAULT 10,
+    linktest_sec      INTEGER NOT NULL DEFAULT 30,
+    enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+    connection_state  TEXT NOT NULL DEFAULT 'NOT_CONNECTED',
+    last_connected_at TIMESTAMPTZ,
+    last_message_at   TIMESTAMPTZ,
+    last_error        TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS secs_messages (
+    id           BIGSERIAL PRIMARY KEY,
+    eq_id        TEXT NOT NULL,
+    direction    TEXT NOT NULL,                        -- SEND / RECV
+    stream       INTEGER NOT NULL,
+    function     INTEGER NOT NULL,
+    w_bit        BOOLEAN NOT NULL DEFAULT FALSE,
+    system_bytes BIGINT NOT NULL DEFAULT 0,
+    description  TEXT NOT NULL DEFAULT '',
+    body         JSONB,
+    raw_hex      TEXT,
+    timestamp    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_secsmsg_eq_time ON secs_messages (eq_id, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS secs_event_rules (
+    id       BIGSERIAL PRIMARY KEY,
+    eq_id    TEXT NOT NULL DEFAULT '',                 -- 空字串 = 套用到所有設備
+    ceid     BIGINT NOT NULL,
+    name     TEXT NOT NULL,
+    action   TEXT NOT NULL,                            -- EQ_STATE / TRACK_OUT_READY / ALARM / LOG_ONLY
+    params   JSONB NOT NULL DEFAULT '{}',
+    enabled  BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE (eq_id, ceid)
+);
+
+-- 站別是否要求作業員先確認 e-SOP 才能進站
+ALTER TABLE operations ADD COLUMN IF NOT EXISTS require_sop_ack BOOLEAN NOT NULL DEFAULT FALSE;
