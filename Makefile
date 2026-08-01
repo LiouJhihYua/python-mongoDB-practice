@@ -1,0 +1,25 @@
+.PHONY: install demo seed simulate run test docker-up docker-down
+
+install:          ## 安裝相依套件
+	pip install -r requirements.txt
+
+demo:             ## 一鍵展示（記憶體資料庫，免安裝 MongoDB）
+	python -m scripts.demo --days 3
+
+seed:             ## 建立主檔（需要 MongoDB）
+	python -m scripts.seed
+
+simulate:         ## 模擬 3 天生產資料（需要 MongoDB）
+	python -m scripts.simulate --days 3
+
+run:              ## 啟動 API 服務
+	uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+test:             ## 執行測試
+	python -m pytest
+
+docker-up:
+	docker compose up -d --build
+
+docker-down:
+	docker compose down

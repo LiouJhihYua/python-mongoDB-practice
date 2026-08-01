@@ -1,0 +1,14 @@
+# OSAT MES — Python + MongoDB
+fastapi>=0.110
+uvicorn[standard]>=0.27
+motor>=3.4
+pymongo>=4.6
+pydantic>=2.6
+pydantic-settings>=2.2
+python-multipart>=0.0.9
+
+# 開發／測試（記憶體模式與測試用，正式部署可不安裝）
+mongomock-motor>=0.0.21
+pytest>=8.0
+pytest-asyncio>=0.23
+httpx>=0.27
