@@ -38,7 +38,7 @@ from app.models.enums import (
     UnitType,
     WorkOrderStatus,
 )
-from app.services import equipment_service, master_service, material_service
+from app.services import equipment_service, master_service, material_service, tool_service
 from app.services.user_service import is_certified
 
 
@@ -152,7 +152,7 @@ async def _write_history(db, lot: dict, action: LotAction, actor: str, **extra) 
     return doc
 
 
-async def _open_hold(db, lot_id: str) -> dict | None:
+async def find_open_hold(db, lot_id: str) -> dict | None:
     return await db[COL_HOLDS].find_one({"lot_id": lot_id, "status": HoldStatus.OPEN.value})
 
 
@@ -258,7 +258,7 @@ async def track_in(db, payload: dict, user: dict) -> dict:
     lot = await get_lot(db, payload["lot_id"], raw=True)
     status = lot["status"]
     if status == LotStatus.HOLD.value:
-        hold = await _open_hold(db, lot["lot_id"])
+        hold = await find_open_hold(db, lot["lot_id"])
         reason = (hold or {}).get("reason", "")
         raise StateError(f"批號 {lot['lot_id']} 扣留中（{reason}），請先放行")
     if status == LotStatus.RUNNING.value:
@@ -306,7 +306,7 @@ async def track_in(db, payload: dict, user: dict) -> dict:
             qtime_limit_min=limit_min, qtime_violation=True,
             remark=f"Q-Time 逾時：等待 {queue_sec / 60:.1f} 分，上限 {limit_min} 分",
         )
-        await _apply_hold(
+        await apply_hold(
             db, lot, HoldReason.QTIME, actor,
             f"Q-Time 逾時自動扣留：等待 {queue_sec / 60:.1f} 分 > 上限 {limit_min} 分",
         )
@@ -347,7 +347,14 @@ async def track_in(db, payload: dict, user: dict) -> dict:
 async def track_out(db, payload: dict, user: dict) -> dict:
     actor = user["username"]
     lot = await get_lot(db, payload["lot_id"], raw=True)
-    if lot["status"] != LotStatus.RUNNING.value:
+    # 加工途中被扣留（例如 SPC 判異）的批號仍須能出站，否則料會卡死在機台上。
+    # 扣留擋的是「下一次進站」，不是「這一次出站」。
+    held_while_running = None
+    if lot["status"] == LotStatus.HOLD.value:
+        held_while_running = await find_open_hold(db, lot["lot_id"])
+        if not held_while_running or held_while_running.get("status_before_hold") != LotStatus.RUNNING.value:
+            raise StateError(f"批號 {lot['lot_id']} 扣留中且不在機台上，請先放行")
+    elif lot["status"] != LotStatus.RUNNING.value:
         raise StateError(f"批號 {lot['lot_id']} 狀態為 {lot['status']}，需先 Track-In 才能出站")
 
     route, step, operation, device = await _context(db, lot)
@@ -416,15 +423,27 @@ async def track_out(db, payload: dict, user: dict) -> dict:
         update["status"] = LotStatus.COMPLETED.value
         update["completed_at"] = now
 
+    if held_while_running is not None and update["status"] != LotStatus.SCRAPPED.value:
+        # 料已離開機台，扣留狀態保留到下一站；放行後回到待進站
+        update["status"] = LotStatus.HOLD.value
+        update.pop("completed_at", None)
+        await db[COL_HOLDS].update_one(
+            {"_id": held_while_running["_id"]},
+            {"$set": {"status_before_hold": LotStatus.WAITING.value}},
+        )
+
     await db[COL_LOTS].update_one(
         {"lot_id": lot["lot_id"]},
         {"$set": update, "$inc": {"scrap_qty": reject}},
     )
+    tool_alerts: list[dict] = []
     if lot.get("eq_id"):
         await equipment_service.set_state(
             db, lot["eq_id"], EquipmentState.STANDBY, actor,
             reason_code="TRACK_OUT", remark=f"批號 {lot['lot_id']} 出站", lot_id=None,
         )
+        # 治具壽命以加工顆數累計；到期會把設備轉為計畫停機待換刀
+        tool_alerts = await tool_service.consume(db, lot["eq_id"], expected, lot["lot_id"], actor)
 
     history = await _write_history(
         db, lot, LotAction.TRACK_OUT, actor,
@@ -448,6 +467,7 @@ async def track_out(db, payload: dict, user: dict) -> dict:
         "step_yield": step_yield,
         "process_sec": history["process_sec"],
     }
+    result["tool_alerts"] = tool_alerts
     return result
 
 
@@ -494,7 +514,7 @@ async def _record_defects(db, lot: dict, operation: dict, defects: list[dict], a
 
 
 # ── 扣留 / 放行 ─────────────────────────────────────────────
-async def _apply_hold(db, lot: dict, reason: HoldReason | str, actor: str, remark: str) -> dict:
+async def apply_hold(db, lot: dict, reason: HoldReason | str, actor: str, remark: str) -> dict:
     now = utcnow()
     await db[COL_HOLDS].insert_one(
         {
@@ -525,9 +545,9 @@ async def hold_lot(db, payload: dict, user: dict) -> dict:
     lot = await get_lot(db, payload["lot_id"], raw=True)
     if lot["status"] not in {LotStatus.WAITING.value, LotStatus.RUNNING.value}:
         raise StateError(f"批號 {lot['lot_id']} 狀態為 {lot['status']}，不可扣留")
-    if await _open_hold(db, lot["lot_id"]):
+    if await find_open_hold(db, lot["lot_id"]):
         raise StateError(f"批號 {lot['lot_id']} 已在扣留中")
-    result = await _apply_hold(db, lot, payload.get("reason", HoldReason.QUALITY), actor, payload.get("remark", ""))
+    result = await apply_hold(db, lot, payload.get("reason", HoldReason.QUALITY), actor, payload.get("remark", ""))
     await _write_history(db, lot, LotAction.HOLD, actor, remark=f"{payload.get('reason')} / {payload.get('remark', '')}")
     return result
 
@@ -535,7 +555,7 @@ async def hold_lot(db, payload: dict, user: dict) -> dict:
 async def release_lot(db, payload: dict, user: dict) -> dict:
     actor = user["username"]
     lot = await get_lot(db, payload["lot_id"], raw=True)
-    hold = await _open_hold(db, lot["lot_id"])
+    hold = await find_open_hold(db, lot["lot_id"])
     if hold is None:
         raise StateError(f"批號 {lot['lot_id']} 目前沒有扣留紀錄")
     now = utcnow()

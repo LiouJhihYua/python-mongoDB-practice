@@ -11,6 +11,7 @@ from app.models.enums import (
     EquipmentState,
     MaterialType,
     OperationType,
+    ToolType,
     UnitTransform,
     UnitType,
 )
@@ -139,6 +140,25 @@ class EquipmentIn(MESModel):
 class EquipmentStateIn(MESModel):
     state: EquipmentState
     reason_code: str = ""
+    remark: str = ""
+
+
+class ToolIn(MESModel):
+    """治具／耗材：毛細管、劈刀、切割刀等以加工顆數計算壽命的品項。"""
+
+    tool_id: str = Field(min_length=2, max_length=32)
+    name: str
+    tool_type: ToolType
+    spec: str = ""
+    op_codes: list[str] = Field(default_factory=list, description="適用站別")
+    life_limit: int = Field(gt=0, description="壽命上限（累計加工顆數）")
+    warning_ratio: float = Field(default=0.9, gt=0, le=1, description="達壽命幾成時預警")
+    active: bool = True
+
+
+class ToolMountIn(MESModel):
+    tool_id: str
+    eq_id: str
     remark: str = ""
 
 

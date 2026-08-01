@@ -54,6 +54,29 @@ def shift_of(dt: datetime) -> str:
     return f"{local:%Y%m%d}-{labels[idx] if idx < len(labels) else f'S{idx + 1}'}"
 
 
+def shift_window(label: str) -> tuple[datetime, datetime]:
+    """由班別代碼還原出該班的起訖時間（UTC），供交接班報表使用。"""
+    date_part, _, code = label.partition("-")
+    starts = sorted(settings.shift_start_hours) or [0]
+    labels = ["D", "N", "S3", "S4"][: len(starts)]
+    try:
+        idx = labels.index(code)
+    except ValueError:
+        raise ValueError(f"班別代碼無法辨識：{label}")
+    tz = timezone(timedelta(hours=settings.tz_offset_hours))
+    try:
+        day = datetime.strptime(date_part, "%Y%m%d").replace(tzinfo=tz)
+    except ValueError:
+        raise ValueError(f"班別日期格式錯誤：{label}（應為 YYYYMMDD-D）")
+
+    start = day.replace(hour=starts[idx])
+    if idx + 1 < len(starts):
+        end = day.replace(hour=starts[idx + 1])
+    else:
+        end = (day + timedelta(days=1)).replace(hour=starts[0])
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
 def mongo_encode(value: Any) -> Any:
     """遞迴把 Enum 轉成原生字串，確保寫入 MongoDB 的都是純量。"""
     if isinstance(value, Enum):

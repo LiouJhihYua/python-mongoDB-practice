@@ -20,10 +20,17 @@ from app.models.enums import (  # noqa: E402
     EquipmentState,
     OperationType,
     Role,
+    ToolType,
     UnitTransform,
     UnitType,
 )
-from app.services import equipment_service, master_service, user_service  # noqa: E402
+from app.services import (  # noqa: E402
+    equipment_service,
+    master_service,
+    spc_service,
+    tool_service,
+    user_service,
+)
 
 ACTOR = "test"
 
@@ -69,6 +76,22 @@ DEFECTS = [
          op_codes=["FT"], default_disposition=DispositionType.SCRAP.value, active=True),
     dict(code="HND-DROP", name="搬運損傷", category=DefectCategory.HANDLING.value,
          op_codes=[], default_disposition=DispositionType.SCRAP.value, active=True),
+]
+
+MEASUREMENT_ITEMS = [
+    dict(item_code="WB-PULL", name="銲線拉力", op_code="WIRE_BOND", device_id="", unit="gf",
+         lsl=3.0, usl=12.0, target=7.0, sample_size=5, auto_hold_on_violation=True, active=True),
+    dict(item_code="SAW-KERF", name="切割道寬度", op_code="WFR_SAW", device_id="", unit="um",
+         lsl=25.0, usl=45.0, target=None, sample_size=5, auto_hold_on_violation=False, active=True),
+]
+
+TOOLS = [
+    dict(tool_id="CAP-001", name="毛細管 01", tool_type=ToolType.CAPILLARY.value, spec="SU-1520",
+         op_codes=["WIRE_BOND"], life_limit=10_000, warning_ratio=0.8, active=True),
+    dict(tool_id="CAP-002", name="毛細管 02", tool_type=ToolType.CAPILLARY.value, spec="SU-1520",
+         op_codes=["WIRE_BOND"], life_limit=10_000, warning_ratio=0.8, active=True),
+    dict(tool_id="BLD-001", name="切割刀 01", tool_type=ToolType.BLADE.value, spec="NBC-ZH",
+         op_codes=["WFR_SAW"], life_limit=500_000, warning_ratio=0.9, active=True),
 ]
 
 USERS = [
@@ -148,6 +171,10 @@ async def factory(db):
         await equipment_service.set_state(db, eq["eq_id"], EquipmentState.STANDBY, ACTOR, "開線")
     for defect in DEFECTS:
         await master_service.create_defect_code(db, dict(defect), ACTOR)
+    for item in MEASUREMENT_ITEMS:
+        await spc_service.create_item(db, dict(item), ACTOR)
+    for tool in TOOLS:
+        await tool_service.create_tool(db, dict(tool), ACTOR)
 
     for wafer in range(1, 51):
         await master_service.create_wafer(

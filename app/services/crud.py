@@ -6,6 +6,7 @@ from typing import Any
 
 from app.errors import DuplicateError, NotFoundError
 from app.models.base import clean, clean_all, mongo_encode, utcnow
+from app.services import audit_service
 
 
 class CRUD:
@@ -23,6 +24,7 @@ class CRUD:
         doc = mongo_encode(dict(payload))
         doc.update(created_at=utcnow(), created_by=actor, updated_at=utcnow(), updated_by=actor)
         await db[self.collection].insert_one(doc)
+        await audit_service.record_change(db, actor, "CREATE", self.collection, key, payload)
         return clean(await db[self.collection].find_one({self.key_field: key}))
 
     async def get(self, db, key: str, required: bool = True) -> dict | None:
@@ -62,6 +64,7 @@ class CRUD:
         result = await db[self.collection].update_one({self.key_field: key}, {"$set": patch})
         if result.matched_count == 0:
             raise NotFoundError(f"找不到{self.label}：{key}")
+        await audit_service.record_change(db, actor, "UPDATE", self.collection, key, patch)
         return clean(await db[self.collection].find_one({self.key_field: key}))
 
     async def deactivate(self, db, key: str, actor: str = "system") -> dict:

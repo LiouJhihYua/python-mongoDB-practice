@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OSAT MES 製造執行系統</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230e1420'/%3E%3Crect x='7' y='7' width='18' height='18' rx='2' fill='none' stroke='%2338bdf8' stroke-width='2'/%3E%3Crect x='13' y='13' width='6' height='6' fill='%2338bdf8'/%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b6fbd'/%3E%3Crect x='7' y='7' width='18' height='18' rx='2' fill='none' stroke='%23ffffff' stroke-width='2'/%3E%3Crect x='13' y='13' width='6' height='6' fill='%23ffffff'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -12,7 +12,7 @@
 <!-- ── 登入 ─────────────────────────────────────────── -->
 <div id="login">
   <form class="login-card" id="login-form">
-    <h1>OSAT <span style="color:var(--accent)">MES</span></h1>
+    <h1>OSAT <span>MES</span></h1>
     <div class="sub">封裝測試廠製造執行系統</div>
     <label for="u">帳號</label>
     <input id="u" autocomplete="username" value="admin" required />
@@ -29,14 +29,19 @@
     <div class="brand">OSAT <span>MES</span></div>
     <nav>
       <button data-view="dashboard" class="active">戰情看板</button>
+      <button data-view="dispatch">派工看板</button>
       <button data-view="lots">在製批號</button>
       <button data-view="shopfloor">現場作業</button>
+      <button data-view="spc">SPC 管制</button>
       <button data-view="equipment">設備管理</button>
+      <button data-view="tools">治具管理</button>
       <button data-view="quality">品質管理</button>
       <button data-view="trace">追溯查詢</button>
       <button data-view="orders">工單</button>
+      <button data-view="handover">交接班</button>
     </nav>
     <div class="user">登入者：<b id="who">-</b></div>
+    <button class="icon-btn" id="theme-toggle" title="切換深／淺色">深色</button>
     <button class="logout" id="logout">登出</button>
   </header>
 
@@ -73,9 +78,32 @@
         <div class="card">
           <h3>設備狀態<small>SEMI E10</small></h3>
           <div id="eq-states"></div>
-          <h3 style="margin-top:18px">班別產出</h3>
+          <h3 style="margin:18px 0 10px">班別產出</h3>
           <div class="table-wrap"><table id="t-moves"></table></div>
         </div>
+        <div class="card">
+          <h3>Q-Time 預警<small>逾時前先看見</small></h3>
+          <div class="table-wrap"><table id="t-qtime"></table></div>
+        </div>
+        <div class="card">
+          <h3>SPC 判異<small>製程往壞的方向漂</small></h3>
+          <div class="table-wrap"><table id="t-spc-alert"></table></div>
+          <h3 style="margin:18px 0 10px">治具待更換</h3>
+          <table id="t-tool-alert"></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 派工看板 -->
+    <section class="view" id="view-dispatch">
+      <div class="toolbar">
+        <input id="dispatch-op" placeholder="站別代碼（留空為全廠）" />
+        <button class="btn primary" id="dispatch-refresh">查詢</button>
+        <span class="muted" id="dispatch-note"></span>
+      </div>
+      <div class="card">
+        <h3>建議加工順序<small>Q-Time 剩餘 → 急單 → 交期 → 等待時間</small></h3>
+        <div class="table-wrap"><table id="t-dispatch"></table></div>
       </div>
     </section>
 
@@ -156,10 +184,59 @@
             <button class="btn" id="btn-release">放行</button>
           </div>
         </div>
+        <div class="card">
+          <h3>SPC 量測回報</h3>
+          <div class="form-grid">
+            <div><label>批號</label><input id="ms-lot" placeholder="L26080001" /></div>
+            <div><label>量測項目</label><select id="ms-item"></select></div>
+            <div style="grid-column:1/-1">
+              <label>量測值（逗號分隔，筆數需等於子群大小）</label>
+              <input id="ms-values" placeholder="7.1, 6.9, 7.0, 7.2, 6.8" />
+            </div>
+          </div>
+          <button class="btn primary" id="btn-measure" style="margin-top:12px">送出量測</button>
+          <div class="muted" style="margin-top:10px;font-size:12px">
+            超規或觸發判異規則時會自動扣留批號。
+          </div>
+        </div>
       </div>
       <div class="card" style="margin-top:14px">
         <h3>作業結果</h3>
         <pre class="json" id="shopfloor-out">尚無操作紀錄</pre>
+      </div>
+    </section>
+
+    <!-- SPC -->
+    <section class="view" id="view-spc">
+      <div class="toolbar">
+        <select id="spc-item"></select>
+        <select id="spc-hours">
+          <option value="24">最近 24 小時</option>
+          <option value="72" selected>最近 3 天</option>
+          <option value="168">最近 7 天</option>
+        </select>
+        <button class="btn primary" id="spc-refresh">查詢</button>
+      </div>
+      <div class="grid kpis" id="spc-kpis"></div>
+      <div class="card">
+        <h3>X-bar 管制圖 <small id="spc-chart-note"></small></h3>
+        <svg class="chart" id="spc-chart" viewBox="0 0 900 260" preserveAspectRatio="none"></svg>
+        <div class="legend">
+          <span><i style="background:var(--ok)"></i>中心線 CL</span>
+          <span><i style="background:var(--bad)"></i>管制界限 UCL / LCL</span>
+          <span><i style="background:var(--warn)"></i>規格界限 USL / LSL</span>
+          <span><i style="background:var(--bad)"></i>紅點＝判異或超規</span>
+        </div>
+      </div>
+      <div class="grid cols-2" style="margin-top:14px">
+        <div class="card">
+          <h3>量測紀錄</h3>
+          <div class="table-wrap"><table id="t-measurements"></table></div>
+        </div>
+        <div class="card">
+          <h3>各項目判異統計</h3>
+          <div class="table-wrap"><table id="t-violations"></table></div>
+        </div>
       </div>
     </section>
 
@@ -176,6 +253,42 @@
       <div class="card">
         <h3>設備稼動與 OEE<small>OEE = 稼動率 × 效能 × 良率</small></h3>
         <div class="table-wrap"><table id="t-oee"></table></div>
+      </div>
+    </section>
+
+    <!-- 治具 -->
+    <section class="view" id="view-tools">
+      <div class="toolbar">
+        <select id="tool-status">
+          <option value="">全部狀態</option>
+          <option value="MOUNTED">已上機</option>
+          <option value="IDLE">在庫</option>
+          <option value="EXPIRED">壽命到期</option>
+          <option value="SCRAPPED">已報廢</option>
+        </select>
+        <button class="btn primary" id="tool-refresh">查詢</button>
+      </div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>待更換治具<small>已到期或接近壽命</small></h3>
+          <div class="table-wrap"><table id="t-tool-attention"></table></div>
+        </div>
+        <div class="card">
+          <h3>換刀作業</h3>
+          <div class="form-grid">
+            <div><label>舊治具</label><input id="tool-old" placeholder="CAP-001" /></div>
+            <div><label>新治具</label><input id="tool-new" placeholder="CAP-002" /></div>
+          </div>
+          <button class="btn primary" id="btn-tool-replace" style="margin-top:12px">執行換刀</button>
+          <div class="muted" style="margin-top:10px;font-size:12px">
+            舊治具下機報廢、新治具上同一台設備，並讓設備回到待機。
+          </div>
+          <pre class="json" id="tool-out" style="margin-top:12px">尚無操作紀錄</pre>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+          <h3>治具清單</h3>
+          <div class="table-wrap"><table id="t-tools"></table></div>
+        </div>
       </div>
     </section>
 
@@ -230,6 +343,36 @@
       <div class="card">
         <h3>工單清單</h3>
         <div class="table-wrap"><table id="t-wos"></table></div>
+      </div>
+    </section>
+
+    <!-- 交接班 -->
+    <section class="view" id="view-handover">
+      <div class="toolbar">
+        <input id="handover-shift" placeholder="班別代碼（留空為本班，例 20260801-D）" style="min-width:280px" />
+        <button class="btn primary" id="handover-refresh">查詢</button>
+        <span class="muted" id="handover-window"></span>
+      </div>
+      <div class="grid kpis" id="handover-kpis"></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>本班新增扣留</h3>
+          <div class="table-wrap"><table id="t-ho-holds"></table></div>
+        </div>
+        <div class="card">
+          <h3>設備停機</h3>
+          <div class="table-wrap"><table id="t-ho-down"></table></div>
+        </div>
+        <div class="card">
+          <h3>下一班優先處理</h3>
+          <div class="table-wrap"><table id="t-ho-next"></table></div>
+        </div>
+        <div class="card">
+          <h3>SPC 判異 / 治具待換</h3>
+          <div class="table-wrap"><table id="t-ho-spc"></table></div>
+          <h3 style="margin:18px 0 10px">治具</h3>
+          <table id="t-ho-tools"></table>
+        </div>
       </div>
     </section>
   </main>

@@ -6,13 +6,21 @@ from datetime import datetime, timedelta
 
 from app.database import (
     COL_DEFECT_RECORDS,
+    COL_EQUIPMENT_LOGS,
+    COL_HOLDS,
     COL_LOT_HISTORY,
     COL_LOTS,
     COL_OPERATIONS,
     COL_WORK_ORDERS,
 )
-from app.models.base import clean_all, ensure_aware, utcnow
-from app.models.enums import ACTIVE_LOT_STATUSES, LotAction, LotStatus, WorkOrderStatus
+from app.models.base import clean_all, ensure_aware, shift_of, shift_window, utcnow
+from app.models.enums import (
+    ACTIVE_LOT_STATUSES,
+    EquipmentState,
+    LotAction,
+    LotStatus,
+    WorkOrderStatus,
+)
 from app.services import equipment_service, quality_service
 
 WIP_STATUSES = [s.value for s in ACTIVE_LOT_STATUSES]
@@ -319,6 +327,91 @@ async def qtime_violations(db, start: datetime, end: datetime, limit: int = 100)
     return clean_all(await cursor.to_list(length=limit))
 
 
+# ── 交接班 ──────────────────────────────────────────────────
+async def shift_handover(db, shift: str | None = None) -> dict:
+    """交接班報表：這一班做了多少、出了什麼事、下一班要接手什麼。"""
+    from app.services import dispatch_service, spc_service, tool_service
+
+    label = shift or shift_of(utcnow())
+    start, end = shift_window(label)
+
+    output = await db[COL_LOT_HISTORY].aggregate(
+        [
+            {"$match": {"action": LotAction.TRACK_OUT.value, "shift": label}},
+            {
+                "$group": {
+                    "_id": None,
+                    "moves": {"$sum": 1},
+                    "good": {"$sum": "$qty_good"},
+                    "reject": {"$sum": "$qty_reject"},
+                    "lots": {"$addToSet": "$lot_id"},
+                }
+            },
+        ]
+    ).to_list(length=1)
+    agg = output[0] if output else {"moves": 0, "good": 0, "reject": 0, "lots": []}
+
+    new_holds = clean_all(
+        await db[COL_HOLDS].find({"held_at": {"$gte": start, "$lt": end}}).to_list(length=None)
+    )
+    downtime = await db[COL_EQUIPMENT_LOGS].aggregate(
+        [
+            {
+                "$match": {
+                    "state": {"$in": [EquipmentState.UNSCHEDULED_DOWN.value, EquipmentState.SCHEDULED_DOWN.value]},
+                    "start_time": {"$gte": start, "$lt": end},
+                }
+            },
+            {
+                "$group": {
+                    "_id": {"eq": "$eq_id", "state": "$state"},
+                    "events": {"$sum": 1},
+                    "seconds": {"$sum": {"$ifNull": ["$duration_sec", 0]}},
+                    "reasons": {"$addToSet": "$reason_code"},
+                }
+            },
+            {"$sort": {"seconds": -1}},
+        ]
+    ).to_list(length=None)
+
+    spc_issues = await spc_service.violation_summary(db, start, end)
+    qtime = await dispatch_service.qtime_watch(db)
+    tools_to_change = await tool_service.attention_list(db)
+    dispatch = await dispatch_service.dispatch_list(db, limit=10)
+
+    return {
+        "shift": label,
+        "window": {"start": start, "end": end},
+        "output": {
+            "moves": agg["moves"],
+            "lots_processed": len(agg.get("lots") or []),
+            "qty_good": agg["good"],
+            "qty_reject": agg["reject"],
+            "yield": round(agg["good"] / (agg["good"] + agg["reject"]), 4)
+            if (agg["good"] + agg["reject"]) else 0.0,
+        },
+        "new_holds": new_holds,
+        "equipment_downtime": [
+            {
+                "eq_id": r["_id"]["eq"],
+                "state": r["_id"]["state"],
+                "events": r["events"],
+                "minutes": round(r["seconds"] / 60, 1),
+                "reasons": sorted(x for x in r["reasons"] if x),
+            }
+            for r in downtime
+        ],
+        "spc_violations": spc_issues,
+        "qtime_watch": {
+            "expired": qtime["expired_count"],
+            "at_risk": qtime["at_risk_count"],
+            "items": qtime["items"][:10],
+        },
+        "tools_to_change": tools_to_change[:10],
+        "next_up": dispatch["items"],
+    }
+
+
 # ── 戰情看板 ────────────────────────────────────────────────
 async def dashboard(db, hours: int = 24) -> dict:
     """單一 API 餵完整個看板，減少前端往返。"""
@@ -331,6 +424,12 @@ async def dashboard(db, hours: int = 24) -> dict:
     moves = await throughput(db, start, now, group_by="shift")
     yields = await yield_by_operation(db, start, now)
     route_yields = await final_yield_by_route(db, start, now)
+
+    from app.services import dispatch_service, spc_service, tool_service
+
+    qtime = await dispatch_service.qtime_watch(db)
+    spc_issues = await spc_service.violation_summary(db, start, now)
+    tools_to_change = await tool_service.attention_list(db)
     pareto = await quality_service.defect_pareto(db, start, now, top_n=8)
     aging = await wip_aging(db)
 
@@ -372,6 +471,9 @@ async def dashboard(db, hours: int = 24) -> dict:
             "worst_route_yield": route_yields[0]["final_yield"] if route_yields else None,
             "equipment_uptime_ratio": eq_states["uptime_ratio"],
             "qtime_violations": violations,
+            "qtime_at_risk": qtime["expired_count"] + qtime["at_risk_count"],
+            "spc_violations": sum(i["violations"] for i in spc_issues),
+            "tools_to_change": len(tools_to_change),
             "defect_qty": (defect_qty[0]["qty"] if defect_qty else 0),
         },
         "wip_by_operation": wip["items"],
@@ -386,4 +488,7 @@ async def dashboard(db, hours: int = 24) -> dict:
         "hold_summary": holds["by_reason"],
         "wip_aging": aging["distribution"],
         "aged_lots": aging["aged_lots"][:10],
+        "qtime_watch": qtime["items"][:10],
+        "spc_violations": spc_issues[:8],
+        "tools_to_change": tools_to_change[:8],
     }

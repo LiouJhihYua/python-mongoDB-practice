@@ -23,7 +23,9 @@ from app.database import (  # noqa: E402
     COL_DEVICES,
     COL_EQUIPMENTS,
     COL_LOTS,
+    COL_MEASUREMENT_ITEMS,
     COL_OPERATIONS,
+    COL_TOOLS,
     COL_USERS,
     COL_WAFERS,
     COL_WORK_ORDERS,
@@ -31,11 +33,18 @@ from app.database import (  # noqa: E402
 )
 from app.errors import MESError  # noqa: E402
 from app.models import base as base_models  # noqa: E402
-from app.models.enums import EquipmentState, LotStatus, WorkOrderStatus  # noqa: E402
+from app.models.enums import (  # noqa: E402
+    EquipmentState,
+    LotStatus,
+    ToolStatus,
+    WorkOrderStatus,
+)
 from app.services import (  # noqa: E402
     equipment_service,
     lot_service,
     master_service,
+    spc_service,
+    tool_service,
     workorder_service,
 )
 
@@ -63,6 +72,11 @@ REJECT_RATE: dict[str, float] = {
 }
 #: FT 不良代碼對應的 Bin 編號
 FT_BIN = {"FT-OPEN": 2, "FT-SHORT": 3, "FT-FUNC": 4, "FT-LEAK": 5, "FT-SPEED": 6}
+
+#: 各站使用的治具前綴（對應 seed 的 TOOL_POOLS）
+TOOL_PREFIX_BY_OP = {"WFR_SAW": "BLD", "DIE_ATTACH": "CLT", "WIRE_BOND": "CAP", "FT": "SKT"}
+#: 每次進站有多少機率做一次 SPC 量測
+MEASURE_PROBABILITY = 1.0
 
 
 class SimClock:
@@ -139,6 +153,112 @@ async def _create_work_orders(db, rng: random.Random, clock: SimClock, count: in
     return wo_nos
 
 
+# ── 治具 ────────────────────────────────────────────────────
+async def _spare_tool(db, op_code: str, rng: random.Random) -> dict | None:
+    """取一支在庫治具；庫存見底就模擬進新品。"""
+    prefix = TOOL_PREFIX_BY_OP.get(op_code)
+    if not prefix:
+        return None
+    spare = await db[COL_TOOLS].find_one(
+        {"op_codes": op_code, "status": ToolStatus.IDLE.value, "active": True}
+    )
+    if spare:
+        return spare
+    template = await db[COL_TOOLS].find_one({"op_codes": op_code})
+    if template is None:
+        return None
+    existing = await db[COL_TOOLS].count_documents({"op_codes": op_code})
+    try:
+        await tool_service.create_tool(
+            db,
+            {"tool_id": f"{prefix}-{existing + 1:03d}", "name": template["name"],
+             "tool_type": template["tool_type"], "spec": template.get("spec", ""),
+             "op_codes": template["op_codes"], "life_limit": template["life_limit"],
+             "warning_ratio": template.get("warning_ratio", 0.85), "active": True},
+            "eng01",
+        )
+    except MESError:
+        return None
+    return await db[COL_TOOLS].find_one({"tool_id": f"{prefix}-{existing + 1:03d}"})
+
+
+async def _mount_initial_tools(db, rng: random.Random) -> int:
+    """開線：每台需要治具的機台各裝一支。"""
+    mounted = 0
+    for op_code in TOOL_PREFIX_BY_OP:
+        equipments = await db[COL_EQUIPMENTS].find({"op_codes": op_code, "active": True}).to_list(length=None)
+        for eq in equipments:
+            if await db[COL_TOOLS].find_one({"eq_id": eq["eq_id"], "status": ToolStatus.MOUNTED.value}):
+                continue
+            spare = await _spare_tool(db, op_code, rng)
+            if spare is None:
+                continue
+            try:
+                await tool_service.mount(db, spare["tool_id"], eq["eq_id"], "eng01", "開線裝刀")
+                mounted += 1
+            except MESError:
+                pass
+    return mounted
+
+
+async def _replace_expired_tools(db, alerts: list[dict], op_code: str, rng: random.Random) -> int:
+    replaced = 0
+    for alert in alerts:
+        if not alert.get("expired"):
+            continue
+        spare = await _spare_tool(db, op_code, rng)
+        if spare is None:
+            continue
+        try:
+            await tool_service.replace(db, alert["tool_id"], spare["tool_id"], "eng01", "壽命到期更換")
+            replaced += 1
+        except MESError:
+            pass
+    return replaced
+
+
+# ── SPC 量測 ────────────────────────────────────────────────
+def _sample_values(item: dict, rng: random.Random, drift: float) -> list[float]:
+    """依規格產生量測值；drift 讓製程會慢慢漂移，管制圖才看得到趨勢。"""
+    lsl, usl = item.get("lsl"), item.get("usl")
+    if lsl is not None and usl is not None:
+        center = item.get("target") if item.get("target") is not None else (lsl + usl) / 2
+        sigma = (usl - lsl) / 12
+    elif lsl is not None:
+        center, sigma = lsl * 1.35, lsl * 0.05
+    else:
+        center, sigma = usl * 0.7, usl * 0.05
+    center += drift * sigma
+    return [round(rng.gauss(center, sigma), 4) for _ in range(int(item["sample_size"]))]
+
+
+async def _record_measurements(
+    db, lot: dict, users: dict, rng: random.Random, drift: dict[tuple, float]
+) -> int:
+    items = await db[COL_MEASUREMENT_ITEMS].find(
+        {"op_code": lot["current_op"], "active": True}
+    ).to_list(length=None)
+    recorded = 0
+    for item in items:
+        if rng.random() > MEASURE_PROBABILITY:
+            continue
+        key = (item["item_code"], lot.get("eq_id"))
+        # 隨機漫步的製程漂移，偶爾會走到觸發判異的區域
+        drift[key] = max(-3.2, min(3.2, drift.get(key, 0.0) + rng.gauss(0, 0.55)))
+        try:
+            await spc_service.record_measurement(
+                db,
+                {"item_code": item["item_code"], "lot_id": lot["lot_id"],
+                 "values": _sample_values(item, rng, drift[key]),
+                 "eq_id": lot.get("eq_id") or "", "remark": ""},
+                users["qc01"],
+            )
+            recorded += 1
+        except MESError:
+            pass
+    return recorded
+
+
 async def _openable_work_orders(db) -> list[str]:
     """尚有剩餘可投料量的工單。"""
     rows = await db[COL_WORK_ORDERS].find(
@@ -204,7 +324,7 @@ async def _open_lot(db, wo_no: str, rng: random.Random) -> dict | None:
         return None
 
 
-async def _do_track_out(db, lot: dict, users: dict, rng: random.Random) -> None:
+async def _do_track_out(db, lot: dict, users: dict, rng: random.Random) -> dict:
     operation = await db[COL_OPERATIONS].find_one({"op_code": lot["current_op"]})
     device = await db[COL_DEVICES].find_one({"device_id": lot["device_id"]})
     op_code = operation["op_code"]
@@ -249,7 +369,7 @@ async def _do_track_out(db, lot: dict, users: dict, rng: random.Random) -> None:
             ]
 
     operator = _pick_operator(users, op_code, rng)
-    await lot_service.track_out(db, payload, operator)
+    return await lot_service.track_out(db, payload, operator)
 
 
 async def simulate(days: int = 3, seed: int = 20250801) -> None:
@@ -280,9 +400,12 @@ async def simulate(days: int = 3, seed: int = 20250801) -> None:
 
 async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: datetime) -> None:
     wo_nos = await _create_work_orders(db, rng, clock, 14)
-    log.info("建立 %d 張工單", len(wo_nos))
+    mounted = await _mount_initial_tools(db, rng)
+    log.info("建立 %d 張工單、裝上 %d 支治具", len(wo_nos), mounted)
 
-    stats = {"track_in": 0, "track_out": 0, "holds": 0, "released": 0, "downs": 0, "shipped": 0}
+    stats = {"track_in": 0, "track_out": 0, "holds": 0, "released": 0,
+             "downs": 0, "shipped": 0, "measured": 0, "tools_changed": 0}
+    drift: dict[tuple, float] = {}
     ticks = 0
     while clock.now < end:
         ticks += 1
@@ -310,8 +433,12 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
             elapsed = (clock.now - base_models.ensure_aware(lot["track_in_at"])).total_seconds()
             if elapsed >= std * rng.uniform(0.85, 1.3):
                 try:
-                    await _do_track_out(db, lot, users, rng)
+                    result = await _do_track_out(db, lot, users, rng)
                     stats["track_out"] += 1
+                    if result.get("tool_alerts"):
+                        stats["tools_changed"] += await _replace_expired_tools(
+                            db, result["tool_alerts"], lot["current_op"], rng
+                        )
                 except MESError as exc:
                     log.debug("出站失敗 %s：%s", lot["lot_id"], exc)
 
@@ -333,6 +460,8 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
                     db, {"lot_id": lot["lot_id"], "eq_id": eq_id, "remark": ""}, operator
                 )
                 stats["track_in"] += 1
+                running_lot = await db[COL_LOTS].find_one({"lot_id": lot["lot_id"]})
+                stats["measured"] += await _record_measurements(db, running_lot, users, rng, drift)
             except MESError:
                 stats["holds"] += 1  # 多為 Q-Time 逾時自動扣留
 
@@ -395,10 +524,11 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
         {"status": {"$in": [LotStatus.WAITING.value, LotStatus.RUNNING.value, LotStatus.HOLD.value]}}
     )
     log.info(
-        "模擬完成：進站 %d / 出站 %d / 自動扣留 %d / 放行 %d / 設備異常 %d / 出貨 %d 批；目前在製 %d 批",
+        "模擬完成：進站 %d / 出站 %d / 自動扣留 %d / 放行 %d / 設備異常 %d / 出貨 %d 批",
         stats["track_in"], stats["track_out"], stats["holds"],
-        stats["released"], stats["downs"], stats["shipped"], wip,
+        stats["released"], stats["downs"], stats["shipped"],
     )
+    log.info("SPC 量測 %d 次 / 換刀 %d 次；目前在製 %d 批", stats["measured"], stats["tools_changed"], wip)
 
 
 async def _demo_split_merge(db, users: dict, stats: dict) -> None:

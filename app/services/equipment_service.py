@@ -76,7 +76,8 @@ async def set_state(
             "$set": {
                 "current_state": state.value,
                 "state_since": now,
-                "state_reason": reason_code or remark,
+                "state_reason": reason_code or remark,  # 代碼便於篩選統計
+                "state_remark": remark,  # 說明給人看
                 "current_lot_id": lot_id,
                 "updated_at": now,
                 "updated_by": actor,

@@ -36,6 +36,10 @@ COL_MATERIALS = "materials"
 COL_MATERIAL_TXNS = "material_transactions"
 COL_WAFERS = "wafers"
 COL_SHIPMENTS = "shipments"
+COL_MEASUREMENT_ITEMS = "measurement_items"
+COL_MEASUREMENTS = "measurements"
+COL_TOOLS = "tools"
+COL_TOOL_LOGS = "tool_logs"
 COL_COUNTERS = "counters"
 COL_AUDIT = "audit_logs"
 
@@ -94,8 +98,25 @@ INDEXES: dict[str, list[IndexModel]] = {
         IndexModel([("assembly_lot_id", ASCENDING)], name="ix_asm_lot"),
     ],
     COL_SHIPMENTS: [IndexModel([("shipment_no", ASCENDING)], unique=True, name="ux_shipment")],
+    COL_MEASUREMENT_ITEMS: [
+        IndexModel([("item_code", ASCENDING)], unique=True, name="ux_item"),
+        IndexModel([("op_code", ASCENDING)], name="ix_op"),
+    ],
+    COL_MEASUREMENTS: [
+        IndexModel([("item_code", ASCENDING), ("timestamp", ASCENDING)], name="ix_item_time"),
+        IndexModel([("lot_id", ASCENDING)], name="ix_lot"),
+        IndexModel([("eq_id", ASCENDING), ("timestamp", DESCENDING)], name="ix_eq_time"),
+    ],
+    COL_TOOLS: [
+        IndexModel([("tool_id", ASCENDING)], unique=True, name="ux_tool"),
+        IndexModel([("eq_id", ASCENDING), ("status", ASCENDING)], name="ix_eq_status"),
+    ],
+    COL_TOOL_LOGS: [IndexModel([("tool_id", ASCENDING), ("timestamp", DESCENDING)], name="ix_tool_time")],
     COL_COUNTERS: [IndexModel([("_id", ASCENDING)], name="ix_counter")],
-    COL_AUDIT: [IndexModel([("timestamp", DESCENDING)], name="ix_time")],
+    COL_AUDIT: [
+        IndexModel([("timestamp", DESCENDING)], name="ix_time"),
+        IndexModel([("actor", ASCENDING), ("timestamp", DESCENDING)], name="ix_actor_time"),
+    ],
 }
 
 

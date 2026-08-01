@@ -25,10 +25,17 @@ from app.models.enums import (  # noqa: E402
     MaterialType,
     OperationType,
     Role,
+    ToolType,
     UnitTransform,
     UnitType,
 )
-from app.services import equipment_service, master_service, user_service  # noqa: E402
+from app.services import (  # noqa: E402
+    equipment_service,
+    master_service,
+    spc_service,
+    tool_service,
+    user_service,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("seed")
@@ -160,6 +167,25 @@ DEFECT_CODES = [
     ("FT-SPEED", "速度不足", DefectCategory.ELECTRICAL, ["FT"], DispositionType.USE_AS_IS),
     ("MAT-NG", "來料不良", DefectCategory.MATERIAL, [], DispositionType.SCRAP),
     ("HND-DROP", "搬運掉落損傷", DefectCategory.HANDLING, [], DispositionType.SCRAP),
+]
+
+# item_code, 名稱, 站別, 單位, LSL, USL, target, 子群大小
+MEASUREMENT_ITEMS = [
+    ("SAW-KERF", "切割道寬度", "WFR_SAW", "um", 25.0, 45.0, None, 5),
+    ("DA-BLT", "黏晶推力", "DIE_ATTACH", "gf", 500.0, None, None, 5),
+    ("DA-THK", "黏晶膠厚", "DIE_ATTACH", "um", 15.0, 35.0, None, 5),
+    ("WB-PULL", "銲線拉力", "WIRE_BOND", "gf", 3.0, 12.0, 7.0, 5),
+    ("WB-BALL", "銲球直徑", "WIRE_BOND", "um", 50.0, 75.0, None, 5),
+    ("MD-THK", "封膠厚度", "MOLD", "mm", 0.85, 0.95, None, 5),
+    ("MK-DEPTH", "雷射印字深度", "LASER_MARK", "um", 8.0, 20.0, None, 3),
+]
+
+# 前綴, 類型, 名稱, 規格, 適用站別, 壽命（累計加工顆數）, 備品數量
+TOOL_POOLS = [
+    ("BLD", ToolType.BLADE, "切割刀", "NBC-ZH 205O-SE", ["WFR_SAW"], 300_000, 10),
+    ("CLT", ToolType.COLLET, "黏晶吸嘴", "Rubber tip 3x3", ["DIE_ATTACH"], 800_000, 10),
+    ("CAP", ToolType.CAPILLARY, "打線毛細管", "SU-1520-31-ZP38", ["WIRE_BOND"], 500_000, 16),
+    ("SKT", ToolType.TEST_SOCKET, "測試座", "QFN/BGA universal", ["FT"], 400_000, 10),
 ]
 
 # material_id, 名稱, 類型, 規格, 單位, 現有量, 安全庫存
@@ -353,6 +379,34 @@ async def seed(reset: bool = False) -> None:
             mid,
         )
     log.info("材料：%d 筆", len(MATERIALS))
+
+    for item_code, name, op_code, unit, lsl, usl, target, n in MEASUREMENT_ITEMS:
+        await _try(
+            spc_service.create_item(
+                db,
+                {"item_code": item_code, "name": name, "op_code": op_code, "device_id": "",
+                 "unit": unit, "lsl": lsl, "usl": usl, "target": target, "sample_size": n,
+                 "auto_hold_on_violation": True, "active": True},
+                ACTOR,
+            ),
+            item_code,
+        )
+    log.info("SPC 量測項目：%d 項", len(MEASUREMENT_ITEMS))
+
+    tool_count = 0
+    for prefix, tool_type, name, spec, op_codes, life, qty in TOOL_POOLS:
+        for idx in range(1, qty + 1):
+            tool_count += await _try(
+                tool_service.create_tool(
+                    db,
+                    {"tool_id": f"{prefix}-{idx:03d}", "name": f"{name} {idx:02d}",
+                     "tool_type": tool_type.value, "spec": spec, "op_codes": op_codes,
+                     "life_limit": life, "warning_ratio": 0.85, "active": True},
+                    ACTOR,
+                ),
+                prefix,
+            )
+    log.info("治具：新增 %d 支", tool_count)
 
     rng = random.Random(20250801)
     wafer_count = 0

@@ -151,6 +151,34 @@ class MaterialType(StrEnum):
     TAPE_REEL = "TAPE_REEL"  # 載帶／捲盤
 
 
+class ToolType(StrEnum):
+    """治具／耗材類型 —— OSAT 以「加工顆數」計算壽命的關鍵管理項目。"""
+
+    CAPILLARY = "CAPILLARY"  # 打線毛細管
+    WEDGE = "WEDGE"  # 劈刀
+    BLADE = "BLADE"  # 切割刀
+    COLLET = "COLLET"  # 吸嘴
+    MOLD_CHASE = "MOLD_CHASE"  # 封膠模具
+    TEST_SOCKET = "TEST_SOCKET"  # 測試座
+
+
+class ToolStatus(StrEnum):
+    IDLE = "IDLE"  # 在庫可用
+    MOUNTED = "MOUNTED"  # 已上機
+    EXPIRED = "EXPIRED"  # 壽命到期，待更換
+    SCRAPPED = "SCRAPPED"  # 已報廢
+
+
+class SPCRule(StrEnum):
+    """統計製程管制的判異規則（Nelson rules 常用子集）。"""
+
+    OUT_OF_SPEC = "OUT_OF_SPEC"  # 量測值超出規格上下限
+    BEYOND_3SIGMA = "BEYOND_3SIGMA"  # 單點超出管制界限
+    RUN_9_SAME_SIDE = "RUN_9_SAME_SIDE"  # 連續 9 點在中心線同側
+    TREND_6 = "TREND_6"  # 連續 6 點持續上升或下降
+    TWO_OF_THREE_2SIGMA = "TWO_OF_THREE_2SIGMA"  # 三點中有兩點落在同側 2σ 外
+
+
 class PMStatus(StrEnum):
     PLANNED = "PLANNED"
     IN_PROGRESS = "IN_PROGRESS"

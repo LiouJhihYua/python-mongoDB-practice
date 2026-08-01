@@ -18,6 +18,14 @@ async def dashboard(db: DB, hours: Annotated[int, Query(ge=1, le=24 * 30)] = 24)
     return await report_service.dashboard(db, hours)
 
 
+@router.get("/shift-handover", dependencies=[CanRead], summary="交接班報表")
+async def shift_handover(
+    db: DB,
+    shift: Annotated[str | None, Query(description="班別代碼，例如 20260801-D；留空取目前班別")] = None,
+):
+    return await report_service.shift_handover(db, shift)
+
+
 @router.get("/wip", dependencies=[CanRead], summary="各站在製量")
 async def wip(db: DB, device_id: str | None = None, customer_code: str | None = None):
     return await report_service.wip_by_operation(db, device_id, customer_code)

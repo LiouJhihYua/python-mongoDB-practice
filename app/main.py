@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,16 +17,22 @@ from app.config import settings
 from app.database import close_db, connect_db, get_db
 from app.errors import MESError
 from app.routers import (
+    audit,
     auth,
+    dispatch,
     equipment,
     lots,
     master,
     materials,
     quality,
     reports,
+    spc,
+    tools,
     trace,
     workorders,
 )
+from app.security import decode_access_token
+from app.services import audit_service
 from app.services.user_service import ensure_bootstrap_admin
 
 logging.basicConfig(
@@ -72,6 +79,43 @@ app.add_middleware(
 )
 
 
+MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _actor_from_request(request: Request) -> str | None:
+    """從 Bearer Token 取出操作者；解不開就當作未登入，不影響請求本身。"""
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None
+    try:
+        return decode_access_token(header.split(" ", 1)[1]).get("sub")
+    except Exception:
+        return None
+
+
+@app.middleware("http")
+async def audit_middleware(request: Request, call_next):
+    """所有異動類請求都留下稽核軌跡（不記錄請求內容，避免寫入密碼）。"""
+    if request.method not in MUTATING_METHODS or request.url.path.startswith(audit_service.SKIP_PATHS):
+        return await call_next(request)
+
+    started = time.perf_counter()
+    response = await call_next(request)
+    try:
+        await audit_service.record_api(
+            get_db(),
+            _actor_from_request(request),
+            request.method,
+            request.url.path,
+            response.status_code,
+            (time.perf_counter() - started) * 1000,
+            request.url.query,
+        )
+    except Exception as exc:  # 稽核失敗不可影響正常作業
+        logger.warning("寫入稽核紀錄失敗：%s", exc)
+    return response
+
+
 @app.exception_handler(MESError)
 async def mes_error_handler(request: Request, exc: MESError) -> JSONResponse:
     """商業邏輯錯誤 → 結構化回應，前端可直接顯示 message。"""
@@ -82,7 +126,10 @@ async def mes_error_handler(request: Request, exc: MESError) -> JSONResponse:
     )
 
 
-for module in (auth, master, workorders, lots, equipment, quality, materials, trace, reports):
+for module in (
+    auth, master, workorders, lots, dispatch, equipment, tools,
+    quality, spc, materials, trace, reports, audit,
+):
     app.include_router(module.router)
 
 
