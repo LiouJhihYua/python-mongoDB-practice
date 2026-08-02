@@ -56,12 +56,25 @@ T_ERP_OUTBOUND = "erp_outbound"
 T_SECS_LINKS = "secs_links"
 T_SECS_MESSAGES = "secs_messages"
 T_SECS_EVENT_RULES = "secs_event_rules"
+T_RECIPES = "recipes"
+T_EQUIPMENT_RECIPES = "equipment_recipes"
+T_RECIPE_CHECKS = "recipe_checks"
+T_SAMPLING_PLANS = "sampling_plans"
+T_SAMPLING_LEVELS = "sampling_levels"
+T_INSPECTIONS = "inspection_records"
+T_COMPLAINTS = "complaints"
+T_COMPLAINT_EVENTS = "complaint_events"
+T_CARRIERS = "carriers"
+T_CARRIER_LOGS = "carrier_logs"
 T_COUNTERS = "counters"
 T_AUDIT = "audit_logs"
 
 #: 依外鍵相依順序排列，清空資料時照這個順序 TRUNCATE
 ALL_TABLES = (
     T_AUDIT, T_SECS_MESSAGES, T_SECS_EVENT_RULES, T_SECS_LINKS,
+    T_RECIPE_CHECKS, T_EQUIPMENT_RECIPES, T_RECIPES,
+    T_INSPECTIONS, T_SAMPLING_LEVELS, T_SAMPLING_PLANS,
+    T_COMPLAINT_EVENTS, T_COMPLAINTS, T_CARRIER_LOGS, T_CARRIERS,
     T_ERP_OUTBOUND, T_ERP_INBOUND, T_SOP_ACKS, T_SOPS,
     T_DIE_ASSIGNMENTS, T_WAFER_MAPS,
     T_TOOL_LOGS, T_TOOLS, T_MATERIAL_TXNS, T_MEASUREMENTS,
@@ -71,7 +84,9 @@ ALL_TABLES = (
     T_OPERATIONS, T_PACKAGES, T_CUSTOMERS, T_USERS, T_COUNTERS,
 )
 
-SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+#: 記錄已套用的版本，讓既有資料庫也能安全升級
+MIGRATIONS_TABLE = "schema_migrations"
 
 
 class _DBState:
@@ -123,9 +138,59 @@ async def _ensure_database(dsn: str, db_name: str) -> str:
     return f"{head}/{db_name}{query}"
 
 
-async def apply_schema(conn: asyncpg.Connection) -> None:
-    """建立資料表與索引（可重複執行）。"""
-    await conn.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+def migration_files() -> list[Path]:
+    """依檔名排序的 migration 清單（``0001_baseline.sql``、``0002_....sql`` …）。"""
+    return sorted(MIGRATIONS_DIR.glob("*.sql"), key=lambda p: p.name)
+
+
+async def applied_migrations(conn: asyncpg.Connection) -> set[str]:
+    rows = await conn.fetch(f"SELECT version FROM {MIGRATIONS_TABLE}")
+    return {r["version"] for r in rows}
+
+
+async def apply_schema(conn: asyncpg.Connection) -> list[str]:
+    """依序套用尚未執行的 migration，回傳這次實際套用的版本。
+
+    ``0001_baseline`` 是完整的初始結構，內容全部是 ``IF NOT EXISTS``，
+    因此在既有資料庫上重跑也是安全的 —— 跑完只是把版本記進去，
+    之後的變更就都走 migration，不會再有「程式碼與資料庫結構不一致」的問題。
+
+    每個 migration 各自跑在一個交易裡：中途失敗不會留下半套結構。
+    """
+    await conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {MIGRATIONS_TABLE} (
+            version    TEXT PRIMARY KEY,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    done = await applied_migrations(conn)
+    applied: list[str] = []
+    for path in migration_files():
+        version = path.stem
+        if version in done:
+            continue
+        logger.info("套用 migration %s", version)
+        async with conn.transaction():
+            await conn.execute(path.read_text(encoding="utf-8"))
+            await conn.execute(
+                f"INSERT INTO {MIGRATIONS_TABLE} (version) VALUES ($1)", version
+            )
+        applied.append(version)
+    return applied
+
+
+async def migration_status(conn: asyncpg.Connection) -> list[dict]:
+    """列出所有 migration 與是否已套用（供維運確認）。"""
+    rows = await conn.fetch(
+        f"SELECT version, applied_at FROM {MIGRATIONS_TABLE} ORDER BY version"
+    )
+    when = {r["version"]: r["applied_at"] for r in rows}
+    return [
+        {"version": p.stem, "applied": p.stem in when, "applied_at": when.get(p.stem)}
+        for p in migration_files()
+    ]
 
 
 async def connect_db(dsn: str | None = None, force: bool = False) -> asyncpg.Pool:

@@ -105,6 +105,7 @@ $("#login-form").addEventListener("submit", async (event) => {
 $("#logout").addEventListener("click", logout);
 
 function logout() {
+  stopLiveDashboard();
   state.token = "";
   state.user = null;
   localStorage.removeItem("mes_token");
@@ -142,7 +143,8 @@ document.querySelectorAll("nav button").forEach((btn) => {
       shopfloor: loadMeasurementItems, spc: loadSpc, equipment: loadOee,
       tools: loadTools, quality: loadQuality, orders: loadWorkOrders,
       handover: loadHandover, wafermap: loadWaferMaps, sop: loadSops,
-      erp: loadErp, secs: loadSecs,
+      erp: loadErp, secs: loadSecs, sampling: loadSampling,
+      recipes: loadRecipes, rma: loadRma,
     };
     loaders[btn.dataset.view]?.();
   });
@@ -150,13 +152,71 @@ document.querySelectorAll("nav button").forEach((btn) => {
 
 /* ── 戰情看板 ────────────────────────────────────────── */
 $("#dash-refresh").addEventListener("click", loadDashboard);
-$("#dash-hours").addEventListener("change", loadDashboard);
+$("#dash-hours").addEventListener("change", () => {
+  loadDashboard();
+  if (liveStream) startLiveDashboard();  // 換區間要重開推播
+});
+
+/** 掛在牆上的看板應該要自己動，而不是等人去按重新整理。 */
+let liveStream = null;
+
+$("#dash-live").addEventListener("change", (event) => {
+  if (event.target.checked) startLiveDashboard();
+  else stopLiveDashboard();
+});
+
+function stopLiveDashboard() {
+  if (liveStream) { liveStream.abort(); liveStream = null; }
+}
+
+async function startLiveDashboard() {
+  stopLiveDashboard();
+  const hours = $("#dash-hours").value;
+  const controller = new AbortController();
+  liveStream = controller;
+  try {
+    // EventSource 帶不了 Authorization 標頭，因此自己解析 SSE 串流
+    const res = await fetch(`/api/reports/dashboard/stream?hours=${hours}&interval=15`, {
+      headers: { Authorization: `Bearer ${state.token}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`自動更新失敗（HTTP ${res.status}）`);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split("\n\n");
+      buffer = chunks.pop();
+      chunks.forEach((chunk) => {
+        const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) return;
+        try { renderDashboard(JSON.parse(line.slice(6)), hours); } catch { /* 忽略壞掉的單筆 */ }
+      });
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      toast(err.message, "err");
+      $("#dash-live").checked = false;
+      liveStream = null;
+    }
+  }
+}
 
 async function loadDashboard() {
   try {
     const hours = $("#dash-hours").value;
-    const d = await api(`/api/reports/dashboard?hours=${hours}`);
-    $("#dash-time").textContent = `資料時間 ${when(d.generated_at)}`;
+    renderDashboard(await api(`/api/reports/dashboard?hours=${hours}`), hours);
+  } catch (err) { toast(err.message, "err"); }
+}
+
+function renderDashboard(d, hours) {
+  try {
+    $("#dash-time").textContent =
+      `資料時間 ${when(d.generated_at)}${liveStream ? "（自動更新中）" : ""}`;
 
     const k = d.kpi;
     const cards = [
@@ -1240,6 +1300,354 @@ async function loadSecs() {
           `${msg.sml || "（無內容）"}`;
       });
     });
+  } catch (err) { toast(err.message, "err"); }
+}
+
+/* ── 抽樣檢驗與屬性管制圖 ───────────────────────────── */
+const INSPECT_TAG = { PENDING: "WAITING", ACCEPT: "RUNNING", REJECT: "HOLD", NOT_REQUIRED: "NON_SCHEDULED" };
+const DECISION_LABEL = { FULL: "全檢", SAMPLED: "抽檢", SKIPPED: "跳批" };
+
+$("#samp-refresh").addEventListener("click", loadSampling);
+$("#samp-chart").addEventListener("change", loadSampling);
+$("#samp-op").addEventListener("change", loadSampling);
+
+$("#samp-judge").addEventListener("click", async () => {
+  const lotId = $("#samp-lot").value.trim();
+  const found = $("#samp-found").value.trim();
+  if (!lotId || found === "") { toast("請輸入批號與檢出不良數", "err"); return; }
+  try {
+    const data = await api("/api/sampling/inspections/judge", {
+      method: "POST", body: { lot_id: lotId, defect_found: Number(found), defects: [] },
+    });
+    toast(data.message, data.accepted ? "ok" : "err");
+    $("#samp-lot").value = ""; $("#samp-found").value = "";
+    loadSampling();
+  } catch (err) { toast(err.message, "err"); }
+});
+
+async function loadSampling() {
+  try {
+    const [pending, plans, summary, overview] = await Promise.all([
+      api("/api/sampling/inspections/pending"),
+      api("/api/sampling/plans"),
+      api("/api/sampling/summary?hours=168"),
+      api("/api/spc/attribute/overview?hours=168"),
+    ]);
+
+    if ($("#samp-op").options.length === 0) {
+      overview.forEach((r) => $("#samp-op").appendChild(el("option", { value: r.op_code }, r.op_code)));
+      if (!overview.length) $("#samp-op").appendChild(el("option", { value: "" }, "（尚無生產資料）"));
+    }
+
+    const rejected = summary.total_rejected;
+    $("#samp-kpis").innerHTML = [
+      { label: "待判定", value: num(pending.length), foot: "等品保回報", kind: pending.length ? "warn" : "ok" },
+      { label: "已檢驗批數", value: num(summary.total_inspected), foot: "最近 7 天" },
+      { label: "跳批批數", value: num(summary.total_skipped), foot: "依抽樣計畫輪替" },
+      { label: "拒收批數", value: num(rejected), foot: "需開立扣留處置", kind: rejected ? "bad" : "ok" },
+    ].map((c) => `
+      <div class="kpi">
+        <div class="label">${esc(c.label)}</div>
+        <div class="value ${c.kind || ""}">${esc(String(c.value))}</div>
+        <div class="foot">${esc(c.foot)}</div>
+      </div>`).join("");
+
+    renderTable("#t-samp-pending", [
+      { title: "批號", key: "lot_id" },
+      { title: "站別", key: "op_code" },
+      { title: "方式", render: (r) => esc(DECISION_LABEL[r.decision] || r.decision) },
+      { title: "批量", num: true, render: (r) => num(r.lot_size) },
+      { title: "抽樣數", num: true, render: (r) => num(r.sample_size) },
+      { title: "允收/拒收", num: true, render: (r) => `${r.accept_number ?? "-"} / ${r.reject_number ?? "-"}` },
+      { title: "時間", render: (r) => when(r.timestamp) },
+    ], pending, "沒有待判定的檢驗");
+
+    renderTable("#t-samp-overview", [
+      { title: "站別", key: "op_code" },
+      { title: "批數", key: "lots", num: true },
+      { title: "檢驗數", num: true, render: (r) => num(r.units) },
+      { title: "不良率", num: true, render: (r) => barCell(r.defect_rate, r.defect_rate > 0.02 ? "bad" : "ok") },
+      { title: "判異點數", num: true, render: (r) => (r.violations ? `<span class="tag HOLD">${r.violations}</span>` : "0") },
+    ], overview, "資料點不足，尚無法建立管制圖");
+
+    renderTable("#t-samp-plans", [
+      { title: "計畫", key: "plan_code" },
+      { title: "站別", key: "op_code" },
+      { title: "方式", key: "plan_type" },
+      { title: "AQL", key: "aql", num: true },
+      { title: "跳批", num: true, render: (r) => `每 ${r.lot_interval} 批` },
+      { title: "級距數", key: "level_count", num: true },
+      { title: "啟用", render: (r) => (r.active ? "是" : "否") },
+    ], plans, "尚未建立抽樣計畫");
+
+    await drawAttributeChart();
+  } catch (err) { toast(err.message, "err"); }
+}
+
+async function drawAttributeChart() {
+  const opCode = $("#samp-op").value;
+  const chartType = $("#samp-chart").value;
+  const svg = $("#samp-chart-svg");
+  if (!opCode) { svg.innerHTML = ""; $("#samp-chart-note").textContent = "尚無生產資料"; return; }
+
+  const data = await api(`/api/spc/attribute/${encodeURIComponent(opCode)}?chart=${chartType}&hours=168`);
+  $("#samp-chart-title").textContent = `${opCode}｜${chartType.toUpperCase()} 圖`;
+  if (!data.ready) {
+    svg.innerHTML = "";
+    $("#samp-chart-note").textContent = data.message || "資料點不足";
+    return;
+  }
+  $("#samp-chart-note").textContent =
+    `中心線 ${Number(data.center).toFixed(6)}｜${data.points.length} 點｜判異 ${data.violations} 點`;
+  drawControlPoints(svg, data.points);
+}
+
+/** 通用的管制圖繪製：逐點的 UCL/LCL 都畫得出來（p 圖與 u 圖需要）。 */
+function drawControlPoints(svg, points) {
+  const W = 760, H = 300, pad = { top: 16, right: 16, bottom: 28, left: 56 };
+  const values = points.flatMap((p) => [p.value, p.ucl, p.lcl]);
+  const min = Math.min(...values), max = Math.max(...values);
+  const span = (max - min) || 1;
+  const lo = min - span * 0.1, hi = max + span * 0.1;
+  const x = (i) => pad.left + (i * (W - pad.left - pad.right)) / Math.max(1, points.length - 1);
+  const y = (v) => H - pad.bottom - ((v - lo) / (hi - lo)) * (H - pad.top - pad.bottom);
+
+  const path = (key, color, dash = "") =>
+    `<polyline fill="none" stroke="${color}" stroke-width="1.5" ${dash ? `stroke-dasharray="${dash}"` : ""}
+      points="${points.map((p, i) => `${x(i).toFixed(1)},${y(p[key]).toFixed(1)}`).join(" ")}" />`;
+
+  const dots = points.map((p, i) =>
+    `<circle cx="${x(i).toFixed(1)}" cy="${y(p.value).toFixed(1)}" r="${p.out_of_control ? 4.5 : 3}"
+       fill="${p.out_of_control ? "#d94b4b" : "#0b6fbd"}" />`).join("");
+
+  svg.innerHTML = `
+    <rect x="0" y="0" width="${W}" height="${H}" fill="none" />
+    <line x1="${pad.left}" y1="${H - pad.bottom}" x2="${W - pad.right}" y2="${H - pad.bottom}"
+          stroke="currentColor" stroke-opacity="0.25" />
+    <line x1="${pad.left}" y1="${pad.top}" x2="${pad.left}" y2="${H - pad.bottom}"
+          stroke="currentColor" stroke-opacity="0.25" />
+    ${path("ucl", "#d94b4b", "4 3")}
+    ${path("lcl", "#d94b4b", "4 3")}
+    ${path("value", "#0b6fbd")}
+    ${dots}
+    <text x="4" y="${y(hi) + 12}" font-size="11" fill="currentColor" opacity="0.6">${hi.toFixed(4)}</text>
+    <text x="4" y="${H - pad.bottom}" font-size="11" fill="currentColor" opacity="0.6">${lo.toFixed(4)}</text>`;
+}
+
+/* ── 配方管理 ────────────────────────────────────────── */
+const RECIPE_STATUS_TAG = { RELEASED: "RUNNING", DRAFT: "WAITING", OBSOLETE: "NON_SCHEDULED" };
+const RECIPE_STATUS_LABEL = { RELEASED: "已發行", DRAFT: "草稿", OBSOLETE: "已作廢" };
+
+$("#rcp-refresh").addEventListener("click", loadRecipes);
+$("#rcp-op").addEventListener("change", loadRecipes);
+$("#rcp-status").addEventListener("change", loadRecipes);
+
+async function loadRecipes() {
+  try {
+    if ($("#rcp-op").options.length <= 1) {
+      const ops = await api("/api/master/operations?limit=200");
+      ops.items.forEach((op) =>
+        $("#rcp-op").appendChild(el("option", { value: op.op_code }, `${op.op_code} ${op.name}`)));
+    }
+    const params = new URLSearchParams();
+    if ($("#rcp-op").value) params.set("op_code", $("#rcp-op").value);
+    if ($("#rcp-status").value) params.set("status", $("#rcp-status").value);
+
+    const [overview, list, checks] = await Promise.all([
+      api("/api/recipes/status"),
+      api(`/api/recipes?${params}`),
+      api("/api/recipes/checks?limit=100"),
+    ]);
+
+    const failed = checks.filter((c) => !c.passed).length;
+    $("#rcp-kpis").innerHTML = [
+      { label: "已發行配方", value: num(overview.released_recipes), foot: "核可可用" },
+      { label: "已載入機台", value: num(overview.loaded), foot: `未載入 ${overview.unloaded} 台` },
+      { label: "未核可配方", value: num(overview.unknown_recipe), foot: "機台載了不認識的配方", kind: overview.unknown_recipe ? "bad" : "ok" },
+      { label: "比對失敗", value: num(failed), foot: "最近 100 次進站比對", kind: failed ? "bad" : "ok" },
+    ].map((c) => `
+      <div class="kpi">
+        <div class="label">${esc(c.label)}</div>
+        <div class="value ${c.kind || ""}">${esc(String(c.value))}</div>
+        <div class="foot">${esc(c.foot)}</div>
+      </div>`).join("");
+
+    renderTable("#t-rcp-equipments", [
+      { title: "設備", render: (r) => `${esc(r.eq_id)}<br><span class="muted" style="font-size:12px">${esc(r.eq_name || "")}</span>` },
+      { title: "機型", key: "model" },
+      { title: "載入配方", render: (r) => (r.ppid
+          ? `<span class="tag ${r.recognised ? "RUNNING" : "HOLD"}">${esc(r.ppid)}</span>`
+          : '<span class="muted">未載入</span>') },
+      { title: "來源", render: (r) => esc(r.source || "-") },
+      { title: "載入時間", render: (r) => when(r.loaded_at) },
+    ], overview.equipments, "尚無設備");
+
+    renderTable("#t-recipes", [
+      { title: "PPID", render: (r) => `<a href="#" data-ppid="${esc(r.ppid)}" data-ver="${r.version}">${esc(r.ppid)}</a>` },
+      { title: "版本", num: true, render: (r) => `v${r.version}` },
+      { title: "站別", key: "op_code" },
+      { title: "料號", render: (r) => esc(r.device_id || "全部") },
+      { title: "狀態", render: (r) => `<span class="tag ${RECIPE_STATUS_TAG[r.status] || ""}">${esc(RECIPE_STATUS_LABEL[r.status] || r.status)}</span>` },
+      { title: "參數數", key: "param_count", num: true },
+    ], list, "尚無配方");
+
+    $("#t-recipes").querySelectorAll("a[data-ppid]").forEach((link) => {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        showRecipe(link.dataset.ppid, link.dataset.ver);
+      });
+    });
+    if (list.length) showRecipe(list[0].ppid, list[0].version);
+
+    renderTable("#t-rcp-checks", [
+      { title: "時間", render: (r) => when(r.timestamp) },
+      { title: "批號", key: "lot_id" },
+      { title: "設備", key: "eq_id" },
+      { title: "站別", key: "op_code" },
+      { title: "機台配方", render: (r) => esc(r.loaded_ppid || "-") },
+      { title: "結果", render: (r) => `<span class="tag ${r.passed ? "RUNNING" : "HOLD"}">${r.passed ? "通過" : "不符"}</span>` },
+      { title: "說明", key: "reason" },
+    ], checks, "尚無比對紀錄");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+async function showRecipe(ppid, version) {
+  try {
+    const recipe = await api(`/api/recipes/${encodeURIComponent(ppid)}?version=${version}`);
+    $("#rcp-title").textContent = `${recipe.ppid} v${recipe.version}｜${recipe.op_code}`;
+    const rows = Object.entries(recipe.parameters || {}).map(([k, v]) => ({ name: k, value: v }));
+    renderTable("#t-rcp-params", [
+      { title: "參數", key: "name" },
+      { title: "設定值", num: true, render: (r) => esc(String(r.value)) },
+    ], rows, "此版本尚無參數");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+/* ── 客訴與載具 ──────────────────────────────────────── */
+const COMPLAINT_TAG = {
+  OPEN: "WAITING", INVESTIGATING: "SCHEDULED_DOWN", ACTION: "SCHEDULED_DOWN",
+  CLOSED: "RUNNING", REJECTED: "NON_SCHEDULED",
+};
+const COMPLAINT_LABEL = {
+  OPEN: "受理中", INVESTIGATING: "調查中", ACTION: "對策執行", CLOSED: "已結案", REJECTED: "不成立",
+};
+const SEVERITY_TAG = { CRITICAL: "HOLD", MAJOR: "SCHEDULED_DOWN", MINOR: "WAITING" };
+const CARRIER_TAG = {
+  EMPTY: "WAITING", IN_USE: "RUNNING", DIRTY: "SCHEDULED_DOWN",
+  MAINTENANCE: "SCHEDULED_DOWN", SCRAPPED: "NON_SCHEDULED",
+};
+
+$("#rma-refresh").addEventListener("click", loadRma);
+$("#rma-status").addEventListener("change", loadRma);
+
+async function loadRma() {
+  try {
+    const status = $("#rma-status").value;
+    const [complaints, summary, carriers, carrierOverview] = await Promise.all([
+      api(`/api/quality-ops/complaints${status ? `?status=${status}` : ""}`),
+      api("/api/quality-ops/complaints/summary?hours=2160"),
+      api("/api/quality-ops/carriers?limit=200"),
+      api("/api/quality-ops/carriers/overview"),
+    ]);
+
+    $("#rma-kpis").innerHTML = [
+      { label: "未結案客訴", value: num(summary.open), foot: `最近 90 天共 ${summary.total} 件`, kind: summary.open ? "warn" : "ok" },
+      { label: "嚴重客訴", value: num(summary.by_severity?.CRITICAL || 0), foot: "CRITICAL", kind: summary.by_severity?.CRITICAL ? "bad" : "ok" },
+      { label: "逾期未結", value: num(summary.overdue.length), foot: "已過承諾日", kind: summary.overdue.length ? "bad" : "ok" },
+      { label: "平均結案天數", value: summary.avg_close_days ?? "—", foot: "已結案客訴" },
+    ].map((c) => `
+      <div class="kpi">
+        <div class="label">${esc(c.label)}</div>
+        <div class="value ${c.kind || ""}">${esc(String(c.value))}</div>
+        <div class="foot">${esc(c.foot)}</div>
+      </div>`).join("");
+
+    renderTable("#t-complaints", [
+      { title: "單號", render: (r) => `<a href="#" data-cm="${esc(r.complaint_no)}">${esc(r.complaint_no)}</a>` },
+      { title: "客戶", key: "customer_code" },
+      { title: "料號", key: "device_id" },
+      { title: "嚴重度", render: (r) => `<span class="tag ${SEVERITY_TAG[r.severity] || ""}">${esc(r.severity)}</span>` },
+      { title: "狀態", render: (r) => `<span class="tag ${COMPLAINT_TAG[r.status] || ""}">${esc(COMPLAINT_LABEL[r.status] || r.status)}</span>` },
+      { title: "影響批數", key: "impacted_lot_count", num: true },
+      { title: "收件", render: (r) => when(r.received_at) },
+    ], complaints, "目前沒有客訴");
+
+    $("#t-complaints").querySelectorAll("a[data-cm]").forEach((link) => {
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        showComplaint(link.dataset.cm);
+      });
+    });
+    if (complaints.length) showComplaint(complaints[0].complaint_no);
+
+    const o = carrierOverview;
+    $("#carrier-kpis").innerHTML = [
+      { label: "載具總數", value: num(o.total), foot: `${o.by_type.length} 種類型` },
+      { label: "使用中", value: num(o.in_use), foot: "已掛批號" },
+      { label: "可用", value: num(o.available), foot: "空的且已清洗", kind: o.available ? "ok" : "warn" },
+      { label: "待清洗", value: num(o.needs_cleaning.length), foot: "達清洗週期", kind: o.needs_cleaning.length ? "warn" : "ok" },
+    ].map((c) => `
+      <div class="kpi">
+        <div class="label">${esc(c.label)}</div>
+        <div class="value ${c.kind || ""}">${esc(String(c.value))}</div>
+        <div class="foot">${esc(c.foot)}</div>
+      </div>`).join("");
+
+    renderTable("#t-carriers", [
+      { title: "載具", key: "carrier_id" },
+      { title: "類型", key: "carrier_type" },
+      { title: "狀態", render: (r) => `<span class="tag ${CARRIER_TAG[r.status] || ""}">${esc(r.status)}</span>` },
+      { title: "掛載批號", render: (r) => esc(r.current_lot_id || "-") },
+      { title: "使用次數", num: true, render: (r) => `${num(r.use_count)}${r.clean_interval ? ` / ${r.clean_interval}` : ""}` },
+    ], carriers.filter((c) => c.status === "IN_USE").slice(0, 50), "目前沒有使用中的載具");
+
+    renderTable("#t-carriers-dirty", [
+      { title: "載具", key: "carrier_id" },
+      { title: "類型", key: "carrier_type" },
+      { title: "使用次數", num: true, render: (r) => `${num(r.use_count)} / ${num(r.clean_interval)}` },
+      { title: "上次清洗", render: (r) => when(r.last_cleaned_at) },
+      { title: "", render: (r) => `<button class="btn small" data-clean="${esc(r.carrier_id)}">完成清洗</button>` },
+    ], o.needs_cleaning, "沒有載具需要清洗");
+
+    $("#t-carriers-dirty").querySelectorAll("button[data-clean]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await api(`/api/quality-ops/carriers/${encodeURIComponent(btn.dataset.clean)}/clean`, { method: "POST" });
+          toast(`${btn.dataset.clean} 已完成清洗`, "ok");
+          loadRma();
+        } catch (err) { toast(err.message, "err"); }
+      });
+    });
+  } catch (err) { toast(err.message, "err"); }
+}
+
+async function showComplaint(complaintNo) {
+  try {
+    const cm = await api(`/api/quality-ops/complaints/${encodeURIComponent(complaintNo)}`);
+    $("#rma-title").textContent = `${cm.complaint_no}｜${cm.customer_code}｜${COMPLAINT_LABEL[cm.status] || cm.status}`;
+
+    const steps = Object.entries(cm.d8_steps).map(([code, title]) => {
+      const filled = (cm.d8 || {})[code];
+      return { code, title, content: filled?.content || "", completed: !!filled?.completed,
+               updated_at: filled?.updated_at, owner: filled?.owner || "" };
+    });
+    renderTable("#t-d8", [
+      { title: "步驟", render: (r) => `${esc(r.code)} ${esc(r.title)}` },
+      { title: "內容", render: (r) => esc(r.content || "—") },
+      { title: "狀態", render: (r) => (r.completed
+          ? '<span class="tag RUNNING">已完成</span>'
+          : '<span class="tag WAITING">未填</span>') },
+      { title: "更新", render: (r) => (r.updated_at ? when(r.updated_at) : "-") },
+    ], steps);
+
+    const impact = cm.impact || {};
+    $("#rma-impact").innerHTML = `
+      <div>申告批號：${(impact.reported_lots || []).map((l) => `<span class="tag">${esc(l)}</span>`).join(" ") || "—"}</div>
+      <div style="margin-top:6px">來源晶圓：${num((impact.source_wafers || []).length)} 片</div>
+      <div style="margin-top:6px">受影響批號：<b>${num(impact.impacted_lot_count || 0)}</b> 個</div>
+      <div style="margin-top:6px">已出貨客戶：${(impact.affected_customers || []).map((c) => `<span class="tag HOLD">${esc(c)}</span>`).join(" ") || "—"}</div>
+      <div style="margin-top:6px">退回品座標：${(impact.returned_dies || []).map((d) =>
+        `<span class="tag">${esc(d.wafer_id)} (${d.die_x}, ${d.die_y})</span>`).join(" ") || "—"}</div>`;
   } catch (err) { toast(err.message, "err"); }
 }
 

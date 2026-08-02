@@ -8,7 +8,7 @@ from app.models.enums import Role
 from app.models.spc import MeasurementIn, MeasurementItemIn
 from app.routers.deps import DB, Window
 from app.security import CurrentUser, get_current_user, require_roles
-from app.services import spc_service
+from app.services import attribute_spc_service, spc_service
 
 router = APIRouter(prefix="/api/spc", tags=["SPC 統計製程管制"])
 
@@ -59,3 +59,28 @@ async def chart(db: DB, item_code: str, window: Window, lot_id: str | None = Non
 async def capability(db: DB, item_code: str, window: Window, device_id: str | None = None):
     start, end = window
     return await spc_service.capability(db, item_code, start, end, device_id)
+
+
+# ── 屬性管制圖（計數值）────────────────────────────────────
+@router.get("/attribute/overview", dependencies=[CanRead], summary="各站不良率 p 圖摘要")
+async def attribute_overview(db: DB, window: Window):
+    start, end = window
+    return await attribute_spc_service.overview(db, start, end)
+
+
+@router.get(
+    "/attribute/{op_code}", dependencies=[CanRead],
+    summary="屬性管制圖：p（不良率）/ np（不良數）/ c（缺點數）/ u（單位缺點數）/ ewma",
+)
+async def attribute_chart(
+    db: DB,
+    op_code: str,
+    window: Window,
+    chart: Annotated[str, Query(pattern="^(p|np|c|u|ewma)$")] = "p",
+    device_id: str | None = None,
+    limit: Annotated[int, Query(ge=10, le=1000)] = 200,
+):
+    start, end = window
+    return await attribute_spc_service.build_chart(
+        db, chart, op_code, start, end, device_id, limit
+    )

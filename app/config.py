@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 480  # 一個班別
     bootstrap_admin: str = "admin"
     bootstrap_admin_password: str = "admin1234"
+    # 連續登入失敗幾次就暫時鎖定帳號，以及鎖定多久
+    login_max_attempts: int = 5
+    login_lockout_minutes: int = 15
+
+    # ── 稽核紀錄保存 ────────────────────────────────────────
+    # 稽核紀錄會無限成長；超過保存期限的資料應先歸檔再清除
+    audit_retention_days: int = 730  # 兩年，一般客戶稽核的要求
 
     # ── 廠務 ────────────────────────────────────────────────
     factory_code: str = "OSAT-KH1"

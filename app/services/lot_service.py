@@ -16,6 +16,7 @@ from typing import Any
 
 from app.config import settings
 from app.database import (
+    T_CARRIERS,
     T_DEFECT_CODES,
     T_DEFECT_RECORDS,
     T_DEVICES,
@@ -45,9 +46,12 @@ from app.models.enums import (
     WorkOrderStatus,
 )
 from app.services import (
+    carrier_service,
     equipment_service,
     master_service,
     material_service,
+    recipe_service,
+    sampling_service,
     sop_service,
     tool_service,
 )
@@ -242,6 +246,18 @@ async def create_lot(db, payload: dict, actor: str) -> dict:
         if wafer_ids:
             await _reserve_wafers(db, wafer_ids, wo["device_id"], qty)
 
+        carrier_id = payload.get("carrier_id", "")
+        if carrier_id:
+            # 載具主檔存在時就走佔用流程，擋掉「同一個 Magazine 掛兩批」
+            known = await fetch_one(
+                db, f"SELECT carrier_id, current_lot_id FROM {T_CARRIERS} WHERE carrier_id = $1",
+                carrier_id,
+            )
+            if known is not None and known["current_lot_id"]:
+                raise StateError(
+                    f"載具 {carrier_id} 目前掛著批號 {known['current_lot_id']}，請先釋放"
+                )
+
         now = utcnow()
         lot_id = await _gen_lot_id(db)
         lot = await fetch_one(
@@ -277,6 +293,8 @@ async def create_lot(db, payload: dict, actor: str) -> dict:
             """,
             qty, WorkOrderStatus.IN_PROGRESS.value, wo["wo_no"],
         )
+        if carrier_id:
+            await carrier_service.assign_if_known(db, carrier_id, lot_id, actor)
         await _write_history(
             db, lot, LotAction.CREATE, actor,
             qty_in=qty, qty_good=qty, unit_in=lot["unit_type"], unit_out=lot["unit_type"],
@@ -342,6 +360,11 @@ async def _track_in_tx(db, payload: dict, user: dict) -> tuple[dict | None, Exce
         if operation.get("require_sop_ack"):
             # 站別要求先讀過 e-SOP：沒簽認新版就進不了站
             await sop_service.ensure_acknowledged(db, op_code, lot["device_id"], actor)
+        if operation.get("require_sampling_decision"):
+            # 抽檢站：先決定這一批是全檢、抽檢還是免檢
+            sampling = await sampling_service.decide(db, lot, operation, actor)
+        else:
+            sampling = None
 
         eq = None
         if operation["requires_equipment"]:
@@ -357,6 +380,16 @@ async def _track_in_tx(db, payload: dict, user: dict) -> tuple[dict | None, Exce
                 raise StateError(f"設備 {eq_id} 正在加工批號 {eq['current_lot_id']}")
             if eq["current_state"] not in RUNNABLE_STATES:
                 raise StateError(f"設備 {eq_id} 目前狀態為 {eq['current_state']}，不可投料")
+
+        if operation.get("require_recipe_check"):
+            # 機台載錯配方是封測廠最常見的品質事故之一，比對結果一律留紀錄。
+            # 失敗的紀錄要跟著交易提交（那正是稽核要的證據），
+            # 所以先寫入、等交易結束後才把錯誤拋出去 —— 與 Q-Time 自動扣留同樣的理由。
+            verdict = await recipe_service.verify_for_track_in(
+                db, lot, payload.get("eq_id") or "", op_code, actor
+            )
+            if not verdict["passed"]:
+                return None, StateError(verdict["message"])
 
         now = utcnow()
         since = ensure_aware(lot["last_track_out_at"] or lot["created_at"])
@@ -408,6 +441,8 @@ async def _track_in_tx(db, payload: dict, user: dict) -> tuple[dict | None, Exce
             queue_sec=round(queue_sec, 1), qtime_limit_min=limit_min, qtime_violation=violated,
             timestamp=now, remark=payload.get("remark", ""),
         )
+        if sampling is not None:
+            result["sampling"] = sampling
         return result, None
 
 
@@ -501,6 +536,12 @@ async def track_out(db, payload: dict, user: dict) -> dict:
             )
 
         result = await _set_lot(db, lot["lot_id"], **update)
+
+        if update["status"] in {LotStatus.COMPLETED.value, LotStatus.SCRAPPED.value}:
+            # 批號離開產線，載具要跟著歸還，否則會一直被佔著
+            await carrier_service.release_for_lot(
+                db, lot["lot_id"], actor, f"批號{update['status']}，自動歸還"
+            )
 
         tool_alerts: list[dict] = []
         if lot["eq_id"]:

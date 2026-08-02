@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from typing import Any
 
+from app.config import settings
 from app.database import T_AUDIT, fetch_all
 from app.models.base import shift_of, utcnow
 
@@ -102,6 +104,55 @@ async def list_audit(
         """,
         kind, actor, path, success, limit,
     )
+
+
+async def export_jsonl(db, before: datetime, limit: int = 100_000) -> str:
+    """把保存期限外的稽核紀錄輸出成 JSON Lines，歸檔後才好清除。
+
+    一行一筆，可以直接 gzip 起來丟冷儲存，需要時再 grep。
+    """
+    rows = await fetch_all(
+        db,
+        f"SELECT * FROM {T_AUDIT} WHERE timestamp < $1 ORDER BY timestamp, id LIMIT $2",
+        before, limit,
+    )
+    return "\n".join(json.dumps(_serialisable(dict(r)), ensure_ascii=False) for r in rows)
+
+
+async def purge(db, before: datetime, dry_run: bool = True) -> dict:
+    """清除保存期限外的稽核紀錄。
+
+    預設只試算不刪除 —— 稽核紀錄刪掉就回不來了，
+    正式清除前應該先用 ``export_jsonl`` 歸檔。
+    """
+    count = int(
+        await db.fetchval(f"SELECT count(*) FROM {T_AUDIT} WHERE timestamp < $1", before) or 0
+    )
+    oldest = await db.fetchval(f"SELECT min(timestamp) FROM {T_AUDIT}")
+    if dry_run or count == 0:
+        return {"before": before, "matched": count, "deleted": 0,
+                "dry_run": True, "oldest": oldest}
+
+    await db.execute(f"DELETE FROM {T_AUDIT} WHERE timestamp < $1", before)
+    return {"before": before, "matched": count, "deleted": count,
+            "dry_run": False, "oldest": oldest}
+
+
+async def retention_status(db) -> dict:
+    """保存概況：目前留了幾筆、最舊的是什麼時候、有多少已超過保存期限。"""
+    cutoff = utcnow() - timedelta(days=settings.audit_retention_days)
+    total = int(await db.fetchval(f"SELECT count(*) FROM {T_AUDIT}") or 0)
+    expired = int(
+        await db.fetchval(f"SELECT count(*) FROM {T_AUDIT} WHERE timestamp < $1", cutoff) or 0
+    )
+    oldest = await db.fetchval(f"SELECT min(timestamp) FROM {T_AUDIT}")
+    return {
+        "retention_days": settings.audit_retention_days,
+        "cutoff": cutoff,
+        "total": total,
+        "expired": expired,
+        "oldest": oldest,
+    }
 
 
 async def activity_summary(db, start: datetime, end: datetime) -> list[dict]:

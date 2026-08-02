@@ -232,4 +232,5 @@ class SECSEventAction(StrEnum):
     EQ_STATE = "EQ_STATE"  # 更新設備 E10 狀態
     TRACK_OUT_READY = "TRACK_OUT_READY"  # 加工結束，提示可出站
     ALARM = "ALARM"  # 設備異常，轉非計畫停機
+    RECIPE_LOADED = "RECIPE_LOADED"  # 機台回報載入的配方，寫回 MES 供進站比對
     LOG_ONLY = "LOG_ONLY"  # 只留紀錄

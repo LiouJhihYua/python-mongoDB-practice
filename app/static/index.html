@@ -36,8 +36,11 @@
       <button data-view="equipment">設備管理</button>
       <button data-view="tools">治具管理</button>
       <button data-view="quality">品質管理</button>
+      <button data-view="sampling">抽樣檢驗</button>
       <button data-view="wafermap">晶圓 Map</button>
       <button data-view="sop">e-SOP</button>
+      <button data-view="recipes">配方管理</button>
+      <button data-view="rma">客訴/載具</button>
       <button data-view="trace">追溯查詢</button>
       <button data-view="orders">工單</button>
       <button data-view="handover">交接班</button>
@@ -61,6 +64,9 @@
           <option value="168">最近 7 天</option>
         </select>
         <button class="btn" id="dash-refresh">重新整理</button>
+        <label class="muted" style="display:inline-flex;align-items:center;gap:6px">
+          <input type="checkbox" id="dash-live" style="min-width:auto" /> 自動更新
+        </label>
         <span class="muted" id="dash-time"></span>
       </div>
       <div class="grid kpis" id="kpis"></div>
@@ -347,6 +353,116 @@
       <div class="card">
         <h3>工單清單</h3>
         <div class="table-wrap"><table id="t-wos"></table></div>
+      </div>
+    </section>
+
+    <!-- 抽樣檢驗 -->
+    <section class="view" id="view-sampling">
+      <div class="toolbar">
+        <button class="btn primary" id="samp-refresh">重新整理</button>
+        <select id="samp-chart">
+          <option value="p">p 圖（不良率，樣本數可變）</option>
+          <option value="np">np 圖（不良數，樣本數固定）</option>
+          <option value="c">c 圖（缺點數）</option>
+          <option value="u">u 圖（單位缺點數）</option>
+          <option value="ewma">EWMA（偵測小幅漂移）</option>
+        </select>
+        <select id="samp-op"></select>
+        <span class="muted">計量值的 X-bar/R 圖在「SPC 管制」頁</span>
+      </div>
+      <div class="grid kpis" id="samp-kpis"></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>待判定檢驗 <small class="muted">回報檢出不良數即判允收／拒收</small></h3>
+          <div class="table-wrap"><table id="t-samp-pending"></table></div>
+          <div class="toolbar" style="margin-top:12px">
+            <input id="samp-lot" placeholder="批號" style="min-width:170px" />
+            <input id="samp-found" placeholder="檢出不良數" style="min-width:130px" />
+            <button class="btn primary" id="samp-judge">判定</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>屬性管制圖 <small id="samp-chart-title"></small></h3>
+          <svg id="samp-chart-svg" viewBox="0 0 760 300" style="width:100%;height:300px"></svg>
+          <div class="muted" id="samp-chart-note" style="font-size:12px"></div>
+        </div>
+        <div class="card">
+          <h3>各站不良率概況 <small class="muted">p 圖判異數</small></h3>
+          <div class="table-wrap"><table id="t-samp-overview"></table></div>
+        </div>
+        <div class="card">
+          <h3>抽樣計畫 <small class="muted">允收水準依客戶合約維護</small></h3>
+          <div class="table-wrap"><table id="t-samp-plans"></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 配方管理 -->
+    <section class="view" id="view-recipes">
+      <div class="toolbar">
+        <button class="btn primary" id="rcp-refresh">重新整理</button>
+        <select id="rcp-op"><option value="">全部站別</option></select>
+        <select id="rcp-status">
+          <option value="RELEASED" selected>已發行</option>
+          <option value="">全部狀態</option>
+          <option value="DRAFT">草稿</option>
+          <option value="OBSOLETE">已作廢</option>
+        </select>
+      </div>
+      <div class="grid kpis" id="rcp-kpis"></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>機台目前載入的配方 <small class="muted">未核可的會標紅</small></h3>
+          <div class="table-wrap"><table id="t-rcp-equipments"></table></div>
+        </div>
+        <div class="card">
+          <h3>配方清單 <small class="muted">點選查看參數</small></h3>
+          <div class="table-wrap"><table id="t-recipes"></table></div>
+        </div>
+        <div class="card">
+          <h3>配方參數 <small id="rcp-title">尚未選擇</small></h3>
+          <div class="table-wrap"><table id="t-rcp-params"></table></div>
+        </div>
+        <div class="card">
+          <h3>進站比對紀錄 <small class="muted">稽核要的證據</small></h3>
+          <div class="table-wrap"><table id="t-rcp-checks"></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 客訴與載具 -->
+    <section class="view" id="view-rma">
+      <div class="toolbar">
+        <button class="btn primary" id="rma-refresh">重新整理</button>
+        <select id="rma-status">
+          <option value="">全部狀態</option>
+          <option value="OPEN">受理中</option>
+          <option value="INVESTIGATING">調查中</option>
+          <option value="ACTION">對策執行</option>
+          <option value="CLOSED">已結案</option>
+        </select>
+      </div>
+      <div class="grid kpis" id="rma-kpis"></div>
+      <div class="grid cols-2">
+        <div class="card">
+          <h3>客訴清單 <small class="muted">點選查看 8D 與影響範圍</small></h3>
+          <div class="table-wrap"><table id="t-complaints"></table></div>
+        </div>
+        <div class="card">
+          <h3>8D 進度 <small id="rma-title">尚未選擇</small></h3>
+          <div class="table-wrap"><table id="t-d8"></table></div>
+          <h3 style="margin:18px 0 10px">受影響範圍</h3>
+          <div id="rma-impact" class="muted">請自左側選擇一張客訴單</div>
+        </div>
+        <div class="card">
+          <h3>載具狀態 <small class="muted">同一載具不可同時掛兩批</small></h3>
+          <div class="grid kpis" id="carrier-kpis"></div>
+          <div class="table-wrap"><table id="t-carriers"></table></div>
+        </div>
+        <div class="card">
+          <h3>待清洗載具 <small class="muted">殘留是外觀不良的隱形來源</small></h3>
+          <div class="table-wrap"><table id="t-carriers-dirty"></table></div>
+        </div>
       </div>
     </section>
 

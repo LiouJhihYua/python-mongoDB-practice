@@ -3,7 +3,7 @@
 以 **Python (FastAPI) + PostgreSQL** 實作，針對 **OSAT（Outsourced Semiconductor Assembly and Test，封裝測試代工廠）** 的作業特性設計的製造執行系統。
 
 涵蓋從**晶圓進料 → 切割 → 黏晶 → 打線 → 封膠 → 印字 → 植球 → 切單 → 外觀檢 → 最終測試 → 編帶包裝 → 出貨**的完整生產管理，含 WIP 追蹤、生產派工、良率分析、SPC 統計製程管制、設備 OEE、治具壽命、Q-Time 管制與正逆向追溯；
-並整合**晶圓 Map 與 die 級追溯、e-SOP 電子作業指導書、ERP 收發介接、SECS/GEM 設備連線**四大現場整合模組。
+並整合**晶圓 Map 與 die 級追溯、e-SOP 電子作業指導書、配方管理、抽樣檢驗、客訴 8D、載具管理、ERP 收發介接、SECS/GEM 設備連線**等現場整合模組。
 
 **整套技術堆疊都採寬鬆開源授權，可自行部署在廠內，無授權費用、無使用範圍限制。**
 
@@ -88,11 +88,53 @@ API 文件在 <http://127.0.0.1:8000/docs>。
 ### SPC 統計製程管制
 良率告訴你「已經做壞了多少」，SPC 告訴你「製程正在往壞的方向漂」。
 
+**計量值**（拉力、厚度、線徑 —— 量得出數字的）：
 * 量測項目主檔：規格上下限、目標值、子群大小、是否自動扣留
 * 量測資料收集：即時判定超規與管制圖異常
 * X-bar / R 管制圖：以**基準期建立並凍結**管制界限
 * 判異規則（Nelson rules 子集）：單點超出 3σ、連續 9 點同側、連續 6 點趨勢、三點中兩點超 2σ
 * 製程能力：Cp / Cpk / Ca 與業界分級
+
+**計數值**（幾顆不良、幾個缺點 —— 基礎是二項／卜瓦松分布，不是常態分布）：
+* **p 圖**：不良率，樣本數可變，管制界限因此逐點變動（批量小的那一點界限自然寬）
+* **np 圖**：不良數，樣本數固定
+* **c / u 圖**：缺點數與單位缺點數
+* **EWMA**：X-bar 圖對「一次跳很大」敏感、對「每天漂一點點」很鈍，EWMA 正好補這個洞
+* 資料直接取自出站紀錄的「應產出量 / 不良數」，不必另建一套收集流程
+
+### 抽樣檢驗（AQL）
+站別主檔一直有 `sampling_rate` 欄位，但先前沒有任何邏輯讀它 —— 設了「抽檢 10%」其實還是全檢。現在把抽樣真正做完：
+
+* **要不要驗**：依抽樣計畫的跳批間隔決定全檢／抽檢／免檢。以**計數輪替**而非隨機決定 —— 抽檢比例必須可稽核，不能每次跑出來的結果都不一樣
+* **驗幾顆**：依批量落在哪個級距取樣本數與允收／拒收數
+* **判允收還是拒收**：檢出不良數達到拒收數就退回品保處置
+* 允收水準刻意做成**資料**而不是寫死的常數：ANSI/ASQ Z1.4 只是起點，每家客戶談定的計畫都不一樣，品保必須能依合約自行維護級距。系統提供 Z1.4 樣本大小代字對照當作建表輔助，實際採用的 Ac/Re 一律以資料庫裡的計畫為準
+
+### 配方管理（Recipe / PPID）
+封測廠最常見的品質事故之一是「機台載錯配方」：料號換了、配方沒換，整批做完才發現。
+
+* **核可清單**與**機台現況**分開存放，進站時交叉比對，不符就擋下來
+* 版本控制與生效日；改版可由現行版本複製出草稿
+* 適用配方依站別／料號／機型挑選，專用版優先於通用版
+* 校驗碼比對是選配：機台有回報才比，沒有這項能力的老機台不會永遠過不了關
+* 比對結果**一律留紀錄**（通過與否都寫）—— 客戶稽核要的是「每一批都比對過」的證據
+* 透過 SECS S7 查詢機台配方清單、取回內容核對、下發配方，並以 S2F41 PP-SELECT 切換
+
+### 客訴（RMA）與 8D
+追溯的能力原本就有，但沒有把手 —— 客訴進來時沒有單可開、圈選出來的範圍沒地方存、8D 做到哪一步也沒人知道。
+
+* 建單當下**自動跑一次影響分析**：申告批號 → 用到的晶圓 → 那些晶圓還做成哪些批 → 那些批出給了誰
+* 有 die 綁定時再往下鑽到晶圓座標，看不良是不是聚在同一區
+* 8D 八個步驟逐步填寫；**根本原因（D4）與永久對策（D5）沒完成就不准結案**
+* 完整處理歷程時間軸，稽核時能還原「誰在什麼時候做了什麼」
+
+### 載具管理
+先前 `lots.carrier_id` 只是自由文字，擋不住「同一個 Magazine 同時掛兩批」—— 這在現場真的會發生，而且發生了很難查。
+
+* 載具主檔與狀態機：空的／使用中／待清洗／保養中／報廢
+* 開批時佔用、完工或報廢時自動歸還
+* 靠資料庫的**部分唯一索引**在最底層擋住重複佔用，而不是仰賴每個程式路徑都記得檢查
+* 清洗週期管理：載具用久了會殘留封膠與粉塵，是外觀不良的隱形來源
 
 ### 治具壽命管理
 毛細管、劈刀、切割刀這類以「累計加工顆數」計壽命的耗材：上下機、出站自動累計、
@@ -156,7 +198,7 @@ SEMI E10 狀態機與狀態履歷、稼動率／OEE 計算、PM 保養工單（�
 app/
 ├── main.py                  FastAPI 應用、稽核 middleware、例外處理、靜態頁面
 ├── config.py                設定（MES_ 開頭環境變數）
-├── schema.sql               資料表與索引定義（啟動時自動套用，可重複執行）
+├── migrations/              資料表結構變更（依序套用，以 schema_migrations 追蹤）
 ├── database.py              asyncpg 連線池、資料表常數、JSONB 編解碼、查詢輔助
 ├── security.py              PBKDF2 密碼雜湊 + HS256 JWT + RBAC（純標準函式庫）
 ├── errors.py                商業邏輯例外 → HTTP 狀態碼
@@ -175,9 +217,11 @@ scripts/
 ├── seed.py                  建立示範主檔（含晶圓 Map、e-SOP、SECS 規則與 ERP 單據）
 ├── simulate.py              離散時間模擬產線跑批，含 SPC 量測、製程漂移、換刀與 die 綁定
 ├── eqsim.py                 SECS/GEM 設備模擬器（HSMS-SS Passive）
+├── migrate.py               套用資料庫結構變更（--status 只看狀態）
+├── purge_audit.py           稽核紀錄歸檔與清除（預設只試算）
 └── demo.py                  一鍵展示：內嵌 PostgreSQL + 主檔 + 模擬 + 網頁
 
-tests/                       267 個測試，涵蓋規則、狀態機、SPC 數學、協定編解碼、報表與 API
+tests/                       372 個測試，涵蓋規則、狀態機、SPC 數學、協定編解碼、報表與 API
 ```
 
 ### 分層原則
@@ -206,7 +250,8 @@ pgserver 會在 `./data/pgdata-demo` 就地啟動一個 PostgreSQL 實例。
 cp .env.example .env          # 依環境調整，務必更換 MES_JWT_SECRET
 pip install -r requirements.txt
 
-createdb osat_mes             # 資料表由程式在啟動時自動建立
+createdb osat_mes             # 結構由程式在啟動時自動套用
+python -m scripts.migrate --status    # （選用）先確認要套用哪些結構變更
 python -m scripts.seed        # 建立主檔
 python -m scripts.simulate --days 3   # （選用）產生模擬生產資料
 uvicorn app.main:app --reload
@@ -248,6 +293,9 @@ python -m scripts.eqsim --port 5001 --eq-id WB-01
 | `MES_SHIFT_START_HOURS` | `[8,20]` | 班別起始時間 |
 | `MES_AUTO_HOLD_ON_QTIME_VIOLATION` | `true` | Q-Time 逾時是否自動扣留 |
 | `MES_SECS_AUTOSTART` | `false` | 啟動時是否自動連線所有啟用中的設備（開發／測試建議關閉） |
+| `MES_LOGIN_MAX_ATTEMPTS` | `5` | 連續登入失敗幾次就鎖定帳號 |
+| `MES_LOGIN_LOCKOUT_MINUTES` | `15` | 鎖定多久 |
+| `MES_AUDIT_RETENTION_DAYS` | `730` | 稽核紀錄保存期限（兩年） |
 
 ---
 
@@ -307,6 +355,18 @@ python -m scripts.eqsim --port 5001 --eq-id WB-01
 | `PUT` | `/api/secs/links/{eq}` · `/api/secs/rules` | 設備連線參數／事件對應規則 |
 | `POST` | `/api/secs/links/{eq}/connect` · `/command` · `/simulate-event` | 連線／遠端指令／模擬事件 |
 | `POST` | `/api/secs/decode` | 解析 HSMS 十六進位訊息 |
+| `POST` | `/api/recipes` · `/{ppid}/{ver}/release` | 建立與發行配方 |
+| `GET` | `/api/recipes/status` · `/checks` | 配方看板／進站比對紀錄 |
+| `POST` | `/api/recipes/equipments/{eq}/download` · `/select` | 下發（S7F3）／切換配方（S2F41）|
+| `POST` | `/api/sampling/plans` | 建立抽樣計畫（含批量級距） |
+| `POST` | `/api/sampling/inspections/judge` | 回報檢出不良並判允收／拒收 |
+| `GET` | `/api/spc/attribute/{op}?chart=p` | 屬性管制圖 p / np / c / u / ewma |
+| `POST` | `/api/quality-ops/complaints` | 開立客訴單（自動圈選受影響範圍）|
+| `PUT` | `/api/quality-ops/complaints/{no}/d8/{step}` | 填寫 8D 步驟 |
+| `POST` | `/api/quality-ops/carriers/assign` | 指派載具給批號 |
+| `GET` | `/api/reports/dashboard/stream` | 戰情看板即時推播（SSE）|
+| `POST` | `/api/auth/refresh` · `/users/{u}/unlock` | Token 續期／解鎖帳號 |
+| `DELETE` | `/api/audit?days=730&confirm=true` | 清除保存期限外的稽核紀錄 |
 | `GET` | `/api/audit` | 稽核軌跡（管理者／品保） |
 
 完整規格見 `/docs`（Swagger UI）。
@@ -383,6 +443,30 @@ SPC 在加工途中判異會扣留批號，但料還在機台上——若連出�
 不同廠牌機台的 CEID 天差地遠。規則以「CEID → MES 動作」存放並可依設備覆寫，
 換一台機台只要加一筆規則，不必改程式。
 
+**結構變更走 migration，不再靠 `CREATE TABLE IF NOT EXISTS` 撐。**
+`app/migrations/` 下的 SQL 依檔名順序套用，已執行的版本記在 `schema_migrations`。
+`0001_baseline` 是完整初始結構且全部冪等，因此在既有資料庫上重跑也安全；
+每個 migration 各自跑在一個交易裡，中途失敗不會留下半套結構。
+
+**配方比對失敗的紀錄必須先提交、再拋錯。**
+與 Q-Time 自動扣留完全相同的理由 —— 比對紀錄（尤其是失敗的那些）正是稽核要的證據，
+若在交易裡直接 `raise`，證據會跟著回滾掉。因此比對函式**刻意不拋例外**，
+一律回傳結果，由呼叫端在交易提交後才決定要不要擋下進站。
+
+**抽檢用計數輪替，不用亂數。**
+「每 10 批抽 1 批」若用 `random() < 0.1` 實作，抽檢比例就變成不可稽核 ——
+客戶問「這批為什麼沒驗」時答不出來。改以「這個站別／料號已決策過幾批」取模輪替，
+同樣的資料永遠得到同樣的結果。
+
+**允收水準是資料，不是常數。**
+ANSI/ASQ Z1.4 只是起點，每家客戶談定的抽樣計畫都不一樣。系統把批量級距與 Ac/Re
+存成可維護的資料，只把「樣本大小代字對照」當作建表輔助 ——
+與其把一份可能記錯的標準寫死在程式裡，不如讓品保依合約自己填。
+
+**載具的互斥靠資料庫的部分唯一索引，不靠應用程式自律。**
+`CREATE UNIQUE INDEX ... ON carriers (current_lot_id) WHERE current_lot_id IS NOT NULL`
+—— 只要有任何一條程式路徑忘了檢查，資料庫還是會擋下來。
+
 ---
 
 ## 測試
@@ -398,7 +482,7 @@ python -m pytest
 MES_TEST_DATABASE_URL=postgresql://user@localhost:5432/mes_test python -m pytest
 ```
 
-267 個測試，涵蓋：
+372 個測試，涵蓋：
 - 密碼／JWT／RBAC 與越權存取
 - 主檔參照完整性與流程版本管理
 - 單位換算、數量結平、不良明細一致性
@@ -431,3 +515,11 @@ MES_TEST_DATABASE_URL=postgresql://user@localhost:5432/mes_test python -m pytest
 - HSMS 只實作 SS（Single Session）與 ACTIVE 模式；由設備主動連入 MES 的 PASSIVE 模式尚未支援。
 - ERP 上行單據目前採「ERP 端拉單」；若要改為 MES 主動推送，需在 `erp_service` 補上目標端點與重送排程。
 - e-SOP 的附件僅存放連結，檔案本身需另置於檔案伺服器或物件儲存。
+- 抽樣計畫的示範資料（`VI-AQL10`）是「看起來合理」的示範值，**不是任何標準的權威版本**；
+  正式使用前務必依與客戶談定的計畫核對級距與 Ac/Re。
+- p 圖在子群極大時（例如一批上百萬顆）管制界限會非常窄，任何批間變異都會判異 ——
+  這是標準 p 圖的已知特性（過度離散）。若批間本來就有變異，應改用 Laney p′ 圖，目前尚未實作。
+- 稽核紀錄的清除是手動觸發（API 或 `scripts/purge_audit.py`），沒有內建排程；
+  請用系統的 cron 或排程器定期執行，並確認先歸檔再刪除。
+- 戰情看板的即時推播採 SSE 輪詢資料庫，適合數十個看板的規模；
+  再大就該改用 LISTEN/NOTIFY 或訊息佇列，避免每個連線都各自查一次。

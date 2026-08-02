@@ -20,6 +20,7 @@ from typing import Any
 
 from app.database import (
     T_EQUIPMENTS,
+    T_RECIPES,
     T_SECS_EVENT_RULES,
     T_SECS_LINKS,
     T_SECS_MESSAGES,
@@ -29,7 +30,7 @@ from app.database import (
 from app.errors import NotFoundError, StateError, ValidationError
 from app.models.base import plain_values, utcnow
 from app.models.enums import EquipmentState, SECSConnectionState, SECSEventAction
-from app.services import audit_service, equipment_service, secs
+from app.services import audit_service, equipment_service, recipe_service, secs
 from app.services.secs_client import HsmsClient
 
 logger = logging.getLogger("mes.secs")
@@ -298,6 +299,19 @@ async def _apply_rule(db, eq_id: str, rule: dict, values: dict[str, Any], actor:
         )
         return {"action": action, "applied": True, "state": eq["current_state"]}
 
+    if action == SECSEventAction.RECIPE_LOADED.value:
+        vid = str(params.get("ppid_vid", "0"))
+        ppid = params.get("ppid") or values.get(vid)
+        if not ppid:
+            return {"action": action, "applied": False, "reason": "事件報告中找不到配方名稱"}
+        checksum_vid = params.get("checksum_vid")
+        row = await recipe_service.set_loaded(
+            db, eq_id,
+            {"ppid": str(ppid), "checksum": str(values.get(str(checksum_vid), "") or "")},
+            actor, source=recipe_service.SOURCE_SECS,
+        )
+        return {"action": action, "applied": True, "ppid": row["ppid"]}
+
     if action == SECSEventAction.TRACK_OUT_READY.value:
         eq = await fetch_one(
             db, f"SELECT eq_id, current_lot_id FROM {T_EQUIPMENTS} WHERE eq_id = $1", eq_id
@@ -452,6 +466,105 @@ async def send_command(db, eq_id: str, payload: dict, actor: str) -> dict:
         db, actor, "COMMAND", T_SECS_LINKS, eq_id, {"command": payload["command"], "hcack": hcack}
     )
     return {"eq_id": eq_id, "command": payload["command"], "hcack": hcack, "reply": reply}
+
+
+async def _require_selected(eq_id: str) -> HsmsClient:
+    client = manager.get(eq_id)
+    if client is None or not client.selected:
+        raise StateError(f"設備 {eq_id} 目前未連線（SELECTED），無法執行此操作")
+    return client
+
+
+async def list_equipment_recipes(db, eq_id: str, actor: str) -> dict:
+    """S7F19 —— 問機台「你身上有哪些配方」。
+
+    導入時最實用的一支：核可清單與機台實際擁有的配方常常對不起來，
+    先撈回來比對，才知道要下發哪幾支。
+    """
+    client = await _require_selected(eq_id)
+    request = {"stream": 7, "function": 19, "w_bit": True, "system_bytes": 0, "body": None}
+    await log_message(db, eq_id, DIRECTION_SEND, request, "查詢機台配方清單")
+    reply = await client.request(7, 19, None)
+    await log_message(db, eq_id, DIRECTION_RECV, reply)
+
+    ppids = secs.to_python(reply.get("body")) or []
+    if isinstance(ppids, str):
+        ppids = [ppids]
+    ppids = [str(p) for p in ppids]
+
+    approved = await fetch_all(
+        db, f"SELECT DISTINCT ppid FROM {T_RECIPES} WHERE status = 'RELEASED'"
+    )
+    approved_set = {r["ppid"] for r in approved}
+    return {
+        "eq_id": eq_id,
+        "ppids": ppids,
+        "approved": sorted(set(ppids) & approved_set),
+        "not_approved": sorted(set(ppids) - approved_set),
+        "missing_on_equipment": sorted(approved_set - set(ppids)),
+    }
+
+
+async def upload_recipe(db, eq_id: str, ppid: str, actor: str) -> dict:
+    """S7F5 —— 把機台上的配方內容取回來，用來核對參數是否被改過。"""
+    client = await _require_selected(eq_id)
+    body = secs.A(ppid)
+    await log_message(
+        db, eq_id, DIRECTION_SEND,
+        {"stream": 7, "function": 5, "w_bit": True, "system_bytes": 0, "body": body},
+        f"取回配方 {ppid}",
+    )
+    reply = await client.request(7, 5, body)
+    await log_message(db, eq_id, DIRECTION_RECV, reply)
+    return {"eq_id": eq_id, "ppid": ppid, "content": secs.to_python(reply.get("body"))}
+
+
+async def download_recipe(db, eq_id: str, ppid: str, version: int | None, actor: str) -> dict:
+    """S7F3 —— 把 MES 上核可的配方下發到機台。"""
+    # 先確認連線：機台沒連上時，「設備未連線」比「找不到配方」更貼近現場實情
+    client = await _require_selected(eq_id)
+    recipe = await recipe_service.get_recipe(db, ppid, version)
+    if recipe["status"] != recipe_service.STATUS_RELEASED:
+        raise StateError(f"配方 {ppid} v{recipe['version']} 尚未發行，不可下發到機台")
+    # PPBODY 以「參數名=值」逐行組成；不同機台格式不同，實機導入時依手冊調整
+    text = "\n".join(f"{k}={v}" for k, v in sorted((recipe["parameters"] or {}).items()))
+    body = secs.L(secs.A(ppid), secs.A(text))
+    await log_message(
+        db, eq_id, DIRECTION_SEND,
+        {"stream": 7, "function": 3, "w_bit": True, "system_bytes": 0, "body": body},
+        f"下發配方 {ppid} v{recipe['version']}",
+    )
+    reply = await client.request(7, 3, body)
+    await log_message(db, eq_id, DIRECTION_RECV, reply)
+
+    ackc7 = secs.to_python(reply.get("body"))
+    if isinstance(ackc7, list):
+        ackc7 = ackc7[0] if ackc7 else None
+    if ackc7 not in (0, None):
+        raise StateError(f"設備 {eq_id} 拒絕配方下發，ACKC7={ackc7}")
+
+    await recipe_service.set_loaded(
+        db, eq_id,
+        {"ppid": ppid, "version": recipe["version"], "checksum": recipe["checksum"]},
+        actor, source=recipe_service.SOURCE_DOWNLOAD,
+    )
+    await audit_service.record_change(
+        db, actor, "DOWNLOAD_RECIPE", T_SECS_LINKS, eq_id, {"ppid": ppid, "version": recipe["version"]}
+    )
+    return {"eq_id": eq_id, "ppid": ppid, "version": recipe["version"], "ackc7": ackc7}
+
+
+async def select_recipe(db, eq_id: str, ppid: str, actor: str) -> dict:
+    """S2F41 PP-SELECT —— 叫機台切換到指定配方，並把結果寫回 MES。"""
+    result = await send_command(
+        db, eq_id, {"command": "PP-SELECT", "parameters": {"PPID": ppid}}, actor
+    )
+    if result.get("hcack") not in (0, None):
+        raise StateError(f"設備 {eq_id} 拒絕切換配方 {ppid}，HCACK={result.get('hcack')}")
+    await recipe_service.set_loaded(
+        db, eq_id, {"ppid": ppid}, actor, source=recipe_service.SOURCE_SECS
+    )
+    return {"eq_id": eq_id, "ppid": ppid, "hcack": result.get("hcack")}
 
 
 async def sync_clock(db, eq_id: str, actor: str, now: datetime | None = None) -> dict:

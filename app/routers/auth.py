@@ -41,6 +41,36 @@ async def me(user: CurrentUser) -> UserOut:
     return UserOut(**user)
 
 
+@router.post("/refresh", response_model=Token, summary="換發 Token（延長班中登入）")
+async def refresh(user: CurrentUser) -> Token:
+    """憑仍然有效的 Token 換一張新的。
+
+    一個班別 8 小時，跨班交接或加班時不該被迫重新登入；
+    但 Token 一旦過期就必須重新驗證密碼，不提供離線續期。
+    """
+    return Token(
+        access_token=create_access_token(user["username"], user.get("roles", [])),
+        expires_in=settings.jwt_expire_minutes * 60,
+        user=UserOut(**user),
+    )
+
+
+@router.get(
+    "/locked", dependencies=[Depends(require_roles(Role.ADMIN))], summary="目前被鎖定的帳號"
+)
+async def locked(db: DB):
+    return await user_service.locked_accounts(db)
+
+
+@router.post(
+    "/users/{username}/unlock",
+    dependencies=[Depends(require_roles(Role.ADMIN))],
+    summary="解鎖帳號",
+)
+async def unlock(db: DB, username: str, user: CurrentUser):
+    return await user_service.unlock(db, username, user["username"])
+
+
 @router.post(
     "/users",
     status_code=status.HTTP_201_CREATED,

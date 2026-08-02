@@ -19,6 +19,7 @@ from app.errors import MESError
 from app.routers import (
     audit,
     auth,
+    complaints,
     dispatch,
     equipment,
     erp,
@@ -26,7 +27,9 @@ from app.routers import (
     master,
     materials,
     quality,
+    recipes,
     reports,
+    sampling,
     secs,
     sop,
     spc,
@@ -143,6 +146,7 @@ for module in (
     auth, master, workorders, lots, dispatch, equipment, tools,
     quality, spc, materials, trace, reports, audit,
     wafermap, sop, erp, secs,
+    recipes, sampling, complaints,
 ):
     app.include_router(module.router)
 

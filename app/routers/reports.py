@@ -1,9 +1,14 @@
 """報表與戰情看板 API。"""
 
+import asyncio
+import json
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import StreamingResponse
 
+from app.database import acquire
+from app.models.base import json_safe
 from app.routers.deps import DB, Window
 from app.security import get_current_user
 from app.services import report_service
@@ -16,6 +21,39 @@ CanRead = Depends(get_current_user)
 @router.get("/dashboard", dependencies=[CanRead], summary="戰情看板總覽（單一 API 餵滿整面牆）")
 async def dashboard(db: DB, hours: Annotated[int, Query(ge=1, le=24 * 30)] = 24):
     return await report_service.dashboard(db, hours)
+
+
+@router.get(
+    "/dashboard/stream", dependencies=[CanRead],
+    summary="戰情看板即時推播（Server-Sent Events）",
+)
+async def dashboard_stream(
+    request: Request,
+    hours: Annotated[int, Query(ge=1, le=24 * 30)] = 24,
+    interval: Annotated[int, Query(ge=5, le=300, description="每幾秒推一次")] = 20,
+):
+    """掛在牆上的看板應該要自己動，而不是等人去按重新整理。
+
+    刻意不長期佔用連線池：每次推播才臨時取一條連線，算完立刻歸還。
+    """
+
+    async def events():
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                async with acquire() as conn:
+                    payload = await report_service.dashboard(conn, hours)
+                yield f"event: dashboard\ndata: {json.dumps(json_safe(payload), ensure_ascii=False)}\n\n"
+            except Exception as exc:  # 單次失敗不該中斷整條推播
+                yield f"event: error\ndata: {json.dumps({'message': str(exc)}, ensure_ascii=False)}\n\n"
+            await asyncio.sleep(interval)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/shift-handover", dependencies=[CanRead], summary="交接班報表")

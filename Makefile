@@ -1,10 +1,13 @@
-.PHONY: install demo seed simulate run eqsim test docker-up docker-down
+.PHONY: install demo seed simulate run eqsim migrate test docker-up docker-down
 
 install:          ## 安裝相依套件
 	pip install -r requirements.txt
 
 demo:             ## 一鍵展示（內嵌 PostgreSQL，免安裝資料庫）
 	python -m scripts.demo --days 3
+
+migrate:          ## 套用資料庫結構變更
+	python -m scripts.migrate
 
 seed:             ## 建立主檔（需要 PostgreSQL）
 	python -m scripts.seed

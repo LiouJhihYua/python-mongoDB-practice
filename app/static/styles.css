@@ -91,18 +91,20 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; }
 /* ── 版面 ───────────────────────────────────────────── */
 #app { display: none; }
 header {
-  display: flex; align-items: center; gap: 18px;
-  padding: 0 20px; height: 56px;
+  display: flex; align-items: center; gap: 12px 18px; flex-wrap: wrap;
+  padding: 8px 20px; min-height: 56px;
   background: var(--panel); border-bottom: 1px solid var(--line);
   position: sticky; top: 0; z-index: 10;
   box-shadow: var(--shadow);
 }
 header .brand { font-weight: 700; letter-spacing: .5px; white-space: nowrap; }
 header .brand span { color: var(--accent); }
-nav { display: flex; gap: 2px; flex: 1; overflow-x: auto; }
+/* 分頁數量已多，改成換行而不是橫向捲動 —— 捲動會把後面的頁籤藏起來 */
+nav { display: flex; flex-wrap: wrap; gap: 2px; flex: 1 1 480px; }
 nav button {
   background: transparent; border: 0; color: var(--muted);
-  padding: 8px 12px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+  padding: 7px 10px; border-radius: 8px; cursor: pointer; white-space: nowrap;
+  font-size: 14px;
 }
 nav button:hover { color: var(--text); background: var(--panel-2); }
 nav button.active { color: var(--accent); background: var(--accent-soft); font-weight: 600; }

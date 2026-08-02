@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # 測試接真的 PostgreSQL，而不是 pgserver 就地啟動的那一個 ——
+    # CI 上快得多，也順便驗證正式部署的連線路徑
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mes
+          POSTGRES_PASSWORD: mes
+          POSTGRES_DB: mes_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安裝相依套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 檢查 migration 可在空資料庫套用
+        env:
+          MES_DB_BACKEND: postgres
+          MES_DATABASE_URL: postgresql://mes:mes@localhost:5432/mes_test
+        run: python -m scripts.migrate --status
+
+      - name: 執行測試
+        env:
+          MES_TEST_DATABASE_URL: postgresql://mes:mes@localhost:5432/mes_test
+          MES_JWT_SECRET: ci-only-secret
+        run: python -m pytest -q
+
+      - name: 種子資料與模擬產線可以跑完
+        env:
+          MES_DB_BACKEND: postgres
+          MES_DATABASE_URL: postgresql://mes:mes@localhost:5432/mes_test
+        run: |
+          python -m scripts.seed --reset
+          python -m scripts.simulate --days 1

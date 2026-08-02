@@ -444,6 +444,9 @@ async def _seed(db, reset: bool) -> None:
     await _seed_sops(db)
     await _seed_secs(db)
     await _seed_erp(db)
+    await _seed_recipes(db)
+    await _seed_sampling(db)
+    await _seed_carriers(db)
     log.info("主檔建立完成。預設帳號：admin / admin1234，其餘帳號密碼為「帳號+1234」")
 
 
@@ -609,6 +612,122 @@ async def _seed_secs(db) -> None:
         )
     log.info("SECS/GEM：連線設定 %d 台、事件規則 %d 條（連線預設停用）",
              len(SECS_LINKS), len(SECS_RULES))
+
+
+# ── 配方 ────────────────────────────────────────────────────
+#: 站別 → 配方參數樣板；實際數值依機型與料號調整
+RECIPE_TEMPLATES = {
+    "WFR_SAW": {"刀具轉速rpm": 30000, "進給速度mm_s": 50, "切割深度um": 80, "冷卻水流量L_min": 1.2},
+    "DIE_ATTACH": {"銲頭溫度C": 150, "停留時間ms": 120, "壓力gf": 300, "膠量mg": 1.5},
+    "WIRE_BOND": {"銲頭溫度C": 175, "超音波功率mW": 95, "壓力gf": 25, "停留時間ms": 12},
+    "FT": {"測試溫度C": 25, "測試程式版本": "v3.2", "接觸壓力gf": 200, "重測次數": 1},
+}
+
+
+async def _seed_recipes(db) -> None:
+    """為每個料號 × 關鍵站別建立一支核可配方，並開啟打線站的配方比對。"""
+    from app.services import recipe_service
+
+    created = 0
+    for device_id, *_rest in DEVICES:
+        short = device_id.split("-")[0]
+        for op_code, params in RECIPE_TEMPLATES.items():
+            ppid = f"{op_code[:2]}-{short}"
+            ok = await _try(
+                recipe_service.create_recipe(
+                    db,
+                    {
+                        "ppid": ppid, "name": f"{device_id} {op_code} 配方", "op_code": op_code,
+                        "device_id": device_id, "eq_model": "",
+                        "parameters": params,
+                        # 校驗碼在實機上由機台回報；示範資料留空表示不比對
+                        "checksum": "", "remark": "示範配方",
+                    },
+                    ACTOR,
+                ),
+                ppid,
+            )
+            if ok:
+                await _try(
+                    recipe_service.release_recipe(
+                        db, ppid, 1, {"effective_from": utcnow() - timedelta(days=90)}, ACTOR
+                    ),
+                    ppid,
+                )
+                created += 1
+
+    # 打線站示範「配方沒對上就不能進站」的管制
+    await db.execute("UPDATE operations SET require_recipe_check = TRUE WHERE op_code = 'WIRE_BOND'")
+    log.info("配方：新增 %d 支（打線站已開啟配方比對）", created)
+
+
+# ── 抽樣檢驗 ────────────────────────────────────────────────
+#: 外觀檢的示範抽樣計畫。
+#: 這是「看起來合理」的示範值，不是任何標準的權威版本 ——
+#: 正式使用前務必依與客戶談定的計畫調整級距與 Ac/Re。
+VI_SAMPLING_LEVELS = [
+    {"lot_size_from": 1, "lot_size_to": 500, "code_letter": "H",
+     "sample_size": 50, "accept_number": 1, "reject_number": 2},
+    {"lot_size_from": 501, "lot_size_to": 3_200, "code_letter": "K",
+     "sample_size": 125, "accept_number": 3, "reject_number": 4},
+    {"lot_size_from": 3_201, "lot_size_to": 35_000, "code_letter": "M",
+     "sample_size": 315, "accept_number": 7, "reject_number": 8},
+    {"lot_size_from": 35_001, "lot_size_to": None, "code_letter": "N",
+     "sample_size": 500, "accept_number": 10, "reject_number": 11},
+]
+
+
+async def _seed_sampling(db) -> None:
+    from app.services import sampling_service
+
+    ok = await _try(
+        sampling_service.create_plan(
+            db,
+            {
+                "plan_code": "VI-AQL10", "name": "外觀檢 AQL 1.0 抽樣", "op_code": "VISUAL_INSP",
+                "device_id": "", "customer_code": "", "plan_type": "AQL",
+                "lot_interval": 1, "aql": 1.0, "inspection_level": "II",
+                "levels": VI_SAMPLING_LEVELS,
+                "remark": "示範用；正式使用前請依客戶合約調整", "active": True,
+            },
+            ACTOR,
+        ),
+        "VI-AQL10",
+    )
+    await db.execute(
+        "UPDATE operations SET require_sampling_decision = TRUE WHERE op_code = 'VISUAL_INSP'"
+    )
+    log.info("抽樣計畫：%s（外觀檢已開啟抽檢決策）", "已建立" if ok else "已存在")
+
+
+# ── 載具 ────────────────────────────────────────────────────
+#: 前綴, 類型, 容量, 清洗週期（使用次數）, 數量
+CARRIER_POOLS = [
+    ("MAG", "MAGAZINE", 25, 40, 30),
+    ("BOAT", "BOAT", 12, 25, 12),
+    ("TRAY", "TRAY", 50, 60, 16),
+]
+
+
+async def _seed_carriers(db) -> None:
+    from app.services import carrier_service
+
+    count = 0
+    for prefix, carrier_type, capacity, clean_interval, qty in CARRIER_POOLS:
+        for index in range(1, qty + 1):
+            count += await _try(
+                carrier_service.create_carrier(
+                    db,
+                    {
+                        "carrier_id": f"{prefix}-{index:03d}", "carrier_type": carrier_type,
+                        "capacity": capacity, "location": "ASSY", "clean_interval": clean_interval,
+                        "remark": "", "active": True,
+                    },
+                    ACTOR,
+                ),
+                prefix,
+            )
+    log.info("載具：新增 %d 個", count)
 
 
 # ── ERP 介接 ────────────────────────────────────────────────

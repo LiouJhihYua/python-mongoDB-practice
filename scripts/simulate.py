@@ -30,10 +30,14 @@ from app.models.enums import (  # noqa: E402
     WorkOrderStatus,
 )
 from app.services import (  # noqa: E402
+    carrier_service,
+    complaint_service,
     equipment_service,
     erp_service,
     lot_service,
     master_service,
+    recipe_service,
+    sampling_service,
     secs_service,
     sop_service,
     spc_service,
@@ -96,6 +100,49 @@ async def _users(db) -> dict[str, dict]:
 def _pick_operator(users: dict[str, dict], op_code: str, rng: random.Random) -> dict:
     candidates = [u for u in users.values() if op_code in (u.get("certifications") or [])]
     return rng.choice(candidates) if candidates else users["eng01"]
+
+
+async def _select_recipe(db, eq_id: str, op_code: str, device_id: str) -> None:
+    """把該站別／料號的核可配方選到機台上（實機走 S2F41 PP-SELECT）。"""
+    approved = await recipe_service.approved_recipes(db, op_code, device_id)
+    if not approved:
+        return
+    current = await recipe_service.loaded_recipe(db, eq_id)
+    if current and current["ppid"] == approved[0]["ppid"]:
+        return
+    try:
+        await recipe_service.set_loaded(
+            db, eq_id,
+            {"ppid": approved[0]["ppid"], "version": approved[0]["version"], "checksum": ""},
+            "op001", recipe_service.SOURCE_MANUAL,
+        )
+    except MESError as exc:
+        log.debug("選配方略過：%s", exc)
+
+
+async def _judge_inspection(db, lot: dict, rng: random.Random) -> str | None:
+    """抽檢站出站後回報檢出不良數並判定；回傳判定結果。"""
+    pending = await fetch_one(
+        db,
+        "SELECT * FROM inspection_records WHERE lot_id = $1 AND result = 'PENDING' "
+        "ORDER BY timestamp DESC LIMIT 1",
+        lot["lot_id"],
+    )
+    if pending is None:
+        return None
+    sample = int(pending["sample_size"] or 0)
+    if sample <= 0:
+        return None
+    # 多數批次乾淨，少數會踩到拒收線 —— 這樣看板上才看得到兩種結果
+    found = 0 if rng.random() < 0.75 else rng.randint(1, max(1, int(sample * 0.05)))
+    try:
+        result = await sampling_service.judge(
+            db, {"lot_id": lot["lot_id"], "defect_found": found, "defects": [], "remark": ""}, "qc01"
+        )
+    except MESError as exc:
+        log.debug("抽檢判定略過 %s：%s", lot["lot_id"], exc)
+        return None
+    return result["result"]
 
 
 async def _ack_sop(db, op_code: str, device_id: str, username: str) -> None:
@@ -322,6 +369,7 @@ async def _open_lot(db, wo_no: str, rng: random.Random) -> dict | None:
         return None
     qty = min(remaining, rng.choice([12, 25, 25]))
     await _replenish_wafers(db, wo["device_id"], qty, rng)
+    carrier_id = await _free_carrier(db, qty)
     wafers = await db.fetch(
         "SELECT wafer_id FROM wafers WHERE device_id = $1 AND NOT consumed ORDER BY wafer_id LIMIT $2",
         wo["device_id"], qty,
@@ -335,7 +383,7 @@ async def _open_lot(db, wo_no: str, rng: random.Random) -> dict | None:
                 "wo_no": wo_no,
                 "qty": qty,
                 "wafer_ids": [w["wafer_id"] for w in wafers],
-                "carrier_id": f"MAG{rng.randint(100, 999)}",
+                "carrier_id": carrier_id,
                 "remark": "",
             },
             "planner01",
@@ -438,7 +486,7 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
 
     stats = {"track_in": 0, "track_out": 0, "holds": 0, "released": 0,
              "downs": 0, "shipped": 0, "measured": 0, "tools_changed": 0,
-             "dies_bound": 0, "dies_tested": 0}
+             "dies_bound": 0, "dies_tested": 0, "inspected": 0, "inspect_rejected": 0}
     drift: dict[tuple, float] = {}
     ticks = 0
     while clock.now < end:
@@ -480,6 +528,11 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
                         stats["dies_bound"] += await _bind_dies(db, lot)
                     elif lot["current_op"] == "FT":
                         stats["dies_tested"] += await _report_die_results(db, lot, rng)
+                    # 抽檢站：出站後由品保回報檢出不良數並判允收／拒收
+                    judged = await _judge_inspection(db, lot, rng)
+                    if judged:
+                        stats["inspected"] += 1
+                        stats["inspect_rejected"] += 1 if judged == "REJECT" else 0
                 except MESError as exc:
                     log.debug("出站失敗 %s：%s", lot["lot_id"], exc)
 
@@ -500,6 +553,9 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
             if operation.get("require_sop_ack"):
                 # 現場實務：作業員在終端機讀完當前版本的 e-SOP 才能開站
                 await _ack_sop(db, lot["current_op"], lot["device_id"], operator["username"])
+            if operation.get("require_recipe_check") and eq_id:
+                # 開站前先把該料號的核可配方選到機台上（實機是 S2F41 PP-SELECT）
+                await _select_recipe(db, eq_id, lot["current_op"], lot["device_id"])
             try:
                 await lot_service.track_in(
                     db, {"lot_id": lot["lot_id"], "eq_id": eq_id, "remark": ""}, operator
@@ -568,6 +624,7 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
     # 收尾：示範拆批與併批，讓族譜追溯有東西可看
     await _demo_split_merge(db, users, stats)
     await _demo_secs_events(db)
+    await _demo_complaint(db)
     await _demo_erp_outbound(db, clock, end)
 
     wip = await db.fetchval(
@@ -580,6 +637,7 @@ async def _run(db, users: dict, rng: random.Random, clock: SimClock, end: dateti
     )
     log.info("SPC 量測 %d 次 / 換刀 %d 次；目前在製 %d 批", stats["measured"], stats["tools_changed"], wip)
     log.info("die 綁定 %d 顆 / 回寫測試結果 %d 顆", stats["dies_bound"], stats["dies_tested"])
+    log.info("抽檢判定 %d 批（拒收 %d 批）", stats["inspected"], stats["inspect_rejected"])
 
 
 async def _demo_split_merge(db, users: dict, stats: dict) -> None:
@@ -678,6 +736,65 @@ async def _report_die_results(db, lot: dict, rng: random.Random) -> int:
         log.debug("die 測試結果回寫略過 %s：%s", lot["lot_id"], exc)
         return 0
     return len(results)
+
+
+async def _free_carrier(db, qty: int) -> str:
+    """挑一個容量夠、目前空著的載具；沒有就先不指派。"""
+    row = await fetch_one(
+        db,
+        """
+        SELECT carrier_id FROM carriers
+        WHERE status = 'EMPTY' AND active AND current_lot_id IS NULL
+          AND (capacity = 0 OR capacity >= $1)
+        ORDER BY use_count, carrier_id LIMIT 1
+        """,
+        qty,
+    )
+    return row["carrier_id"] if row else ""
+
+
+async def _demo_complaint(db) -> None:
+    """開一張客訴單，讓 RMA 與 8D 頁面有東西可看。"""
+    shipment = await fetch_one(
+        db, "SELECT * FROM shipments ORDER BY shipped_at DESC LIMIT 1"
+    )
+    if shipment is None or not shipment["lot_ids"]:
+        return
+    lot_id = list(shipment["lot_ids"])[0]
+    try:
+        complaint = await complaint_service.create_complaint(
+            db,
+            {
+                "customer_code": shipment["customer_code"],
+                "customer_ref": "CUST-RMA-0001",
+                "device_id": "",
+                "lot_ids": [lot_id],
+                "unit_seqs": [],
+                "qty": 12,
+                "severity": "MAJOR",
+                "category": "電性",
+                "description": "客戶端二次測試出現開路，比例約 0.3%",
+                "owner": "qc01",
+                "due_date": None,
+                "received_at": None,
+            },
+            "qc01",
+        )
+    except MESError as exc:
+        log.debug("客訴示範略過：%s", exc)
+        return
+
+    no = complaint["complaint_no"]
+    for step, content in (
+        ("D1", "品保、製程、設備三方成立小組"),
+        ("D2", "客戶端 FT 開路，集中在同一晶圓母批"),
+        ("D3", "同母批其餘批號暫停出貨並複檢"),
+    ):
+        await complaint_service.update_d8(db, no, step, {"content": content}, "qc01")
+    log.info(
+        "示範客訴：%s（圈出 %d 個受影響批號）",
+        no, complaint["impact"]["impacted_lot_count"],
+    )
 
 
 async def _demo_secs_events(db) -> None:
