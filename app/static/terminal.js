@@ -192,9 +192,15 @@ async function loadStation() {
     state.lot = data.current_lot;
     renderLot(data.current_lot);
   } else if (!state.lot) {
-    $("#lot-body").innerHTML = '<div class="empty-hint">尚未掃描批號</div>';
-    $("#lot-actions").innerHTML = "";
+    clearLotPanel();
   }
+}
+
+/** 批號面板有三塊，清空要一起清 —— 分開寫過一次就會漏掉其中一塊。 */
+function clearLotPanel() {
+  $("#lot-body").innerHTML = '<div class="empty-hint">尚未掃描批號</div>';
+  $("#lot-checks").innerHTML = "";
+  $("#lot-actions").innerHTML = "";
 }
 
 function renderQueue(queue, total, truncated) {
@@ -254,8 +260,7 @@ $("#scan").addEventListener("keydown", async (event) => {
 });
 $("#scan-clear").addEventListener("click", () => {
   state.lot = null;
-  $("#lot-body").innerHTML = '<div class="empty-hint">尚未掃描批號</div>';
-  $("#lot-actions").innerHTML = "";
+  clearLotPanel();
   clearBanner();
   focusScan();
 });
@@ -322,15 +327,17 @@ function renderLot(check) {
             info.qtime_remaining_min < 0
               ? `逾時 ${Math.abs(info.qtime_remaining_min).toFixed(0)} 分`
               : `剩 ${info.qtime_remaining_min.toFixed(0)} 分`}</b></div>` : ""}
-    </div>
-    <div class="checks">
-      ${(check.blockers || []).map((b) =>
-        `<div class="check block"><span class="icon">✕</span><span>${esc(b)}</span></div>`).join("")}
-      ${(check.warnings || []).map((w) =>
-        `<div class="check warn"><span class="icon">!</span><span>${esc(w)}</span></div>`).join("")}
-      ${!(check.blockers || []).length && !(check.warnings || []).length
-        ? '<div class="check ok"><span class="icon">✓</span><span>所有前置檢查都通過</span></div>' : ""}
     </div>`;
+
+  // 阻擋原因刻意跟按鈕放在一起，不寫進上面會捲動的詳情區 ——
+  // 「按鈕是灰的但看不到為什麼」正是這頁要消滅的情況
+  $("#lot-checks").innerHTML =
+    (check.blockers || []).map((b) =>
+      `<div class="check block"><span class="icon">✕</span><span>${esc(b)}</span></div>`).join("") +
+    (check.warnings || []).map((w) =>
+      `<div class="check warn"><span class="icon">!</span><span>${esc(w)}</span></div>`).join("") +
+    (!(check.blockers || []).length && !(check.warnings || []).length
+      ? '<div class="check ok"><span class="icon">✓</span><span>所有前置檢查都通過</span></div>' : "");
 
   $("#lot-actions").innerHTML = (check.actions || []).map((a) => {
     const cls = a.action === "TRACK_IN" || a.action === "TRACK_OUT" || a.action === "ACK_SOP"

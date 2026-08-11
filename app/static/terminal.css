@@ -120,8 +120,10 @@ body {
 
 /* 批號詳情可以捲，動作按鈕永遠釘在面板底部 ——
    大字回饋一出現版面就被往下推，按鈕掉到摺線下面是現場最容易漏按的地方 */
-#lot-panel { display: grid; grid-template-rows: auto 1fr auto; overflow: hidden; }
+#lot-panel { display: grid; grid-template-rows: auto 1fr auto auto; overflow: hidden; }
 #lot-body { overflow-y: auto; min-height: 0; }
+/* 阻擋原因很多時它自己捲，但不會被詳情區推出畫面 */
+#lot-checks { max-height: 32vh; overflow-y: auto; }
 .panel-title { color: var(--muted); font-size: 16px; letter-spacing: 1px; margin-bottom: 12px; }
 .empty-hint { color: var(--muted); font-size: 22px; padding: 36px 0; text-align: center; }
 
