@@ -1,0 +1,232 @@
+/* 現場終端機樣式。
+   設計前提跟辦公室看板完全不同：站著看、戴手套點、環境光可能很亮或很暗。
+   所以：字大、按鈕大（最小 56px 觸控目標）、對比高、顏色只用來表達狀態。 */
+
+:root {
+  --bg: #0f141a;
+  --panel: #182029;
+  --panel-2: #1f2933;
+  --line: #2b3641;
+  --text: #eef3f8;
+  --muted: #93a3b3;
+  --accent: #3b9dff;
+  --ok: #35c46a;
+  --warn: #f5a524;
+  --bad: #ff5a5a;
+  --ok-soft: rgba(53, 196, 106, .14);
+  --warn-soft: rgba(245, 165, 36, .14);
+  --bad-soft: rgba(255, 90, 90, .14);
+  --accent-soft: rgba(59, 157, 255, .14);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 20px;
+  -webkit-text-size-adjust: 100%;
+  /* 終端機是固定畫面，不要整頁捲動 —— 捲到一半按錯鈕是現場常見的抱怨 */
+  overflow: hidden;
+}
+
+.screen { display: none; height: 100vh; flex-direction: column; }
+.screen.active { display: flex; }
+
+/* ── 登入 ─────────────────────────────────────────── */
+#login { align-items: center; justify-content: center; }
+.login-box {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  padding: 40px; width: min(520px, 92vw); display: flex; flex-direction: column; gap: 10px;
+}
+.login-box h1 { margin: 0 0 18px; font-size: 34px; }
+.login-box label { color: var(--muted); font-size: 17px; }
+.login-box input {
+  font-size: 26px; padding: 16px 18px; border-radius: 10px;
+  border: 2px solid var(--line); background: var(--panel-2); color: var(--text);
+}
+.login-box input:focus { outline: none; border-color: var(--accent); }
+.login-box button {
+  margin-top: 14px; font-size: 24px; font-weight: 700; padding: 18px;
+  border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer;
+}
+.hint { color: var(--muted); font-size: 15px; margin-top: 10px; }
+.hint.err { color: var(--bad); }
+
+/* ── 頂列 ─────────────────────────────────────────── */
+.bar {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.bar .eq b { font-size: 24px; }
+.bar .who { color: var(--muted); font-size: 17px; }
+.bar .who b { color: var(--text); }
+.bar .clock { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 22px; color: var(--muted); }
+.ghost {
+  background: transparent; border: 2px solid var(--line); color: var(--muted);
+  border-radius: 10px; padding: 12px 18px; font-size: 17px; cursor: pointer; min-height: 48px;
+}
+.ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── 掃描列 ───────────────────────────────────────── */
+.scan-row { display: flex; gap: 12px; padding: 16px 20px; }
+.scan-row input {
+  flex: 1; font-size: 30px; padding: 18px 22px; border-radius: 12px;
+  border: 3px solid var(--accent); background: var(--panel); color: var(--text);
+  letter-spacing: 1px;
+}
+.scan-row input:focus { outline: none; box-shadow: 0 0 0 4px var(--accent-soft); }
+.scan-row.big input { font-size: 34px; }
+
+/* ── 大字回饋 ─────────────────────────────────────── */
+/* 現場最大的抱怨是「按下去被擋，但不知道為什麼」，所以錯誤訊息要跟成功一樣大聲 */
+.banner { margin: 0 20px; border-radius: 12px; padding: 0; max-height: 0; overflow: hidden; transition: max-height .15s; }
+.banner.show { padding: 18px 22px; max-height: 400px; margin-bottom: 12px; }
+.banner .title { font-size: 26px; font-weight: 700; }
+.banner .detail { font-size: 19px; margin-top: 6px; line-height: 1.6; }
+.banner.ok { background: var(--ok-soft); border: 2px solid var(--ok); }
+.banner.ok .title { color: var(--ok); }
+.banner.warn { background: var(--warn-soft); border: 2px solid var(--warn); }
+.banner.warn .title { color: var(--warn); }
+.banner.err { background: var(--bad-soft); border: 2px solid var(--bad); }
+.banner.err .title { color: var(--bad); }
+
+/* ── 主要版面 ─────────────────────────────────────── */
+.cols {
+  display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px;
+  padding: 0 20px 20px; flex: 1; min-height: 0;
+}
+/* 1024×768 是很常見的現場觸控螢幕。那個尺寸稀缺的是「高度」不是寬度，
+   所以維持兩欄；斷點壓到 900px，讓真正窄的畫面（直立平板）才改成上下堆疊。 */
+@media (max-width: 900px) {
+  /* 堆疊之後三塊面板一定塞不進一個畫面，必須讓它可以捲 ——
+     body 是 overflow:hidden，這裡不放行的話下面的內容根本碰不到 */
+  .cols { grid-template-columns: 1fr; overflow-y: auto; }
+  .right-col { grid-template-rows: auto auto; }
+  .panel, #lot-panel, #lot-body { overflow: visible; }
+  #lot-panel { display: block; }
+}
+
+/* 佇列可以捲，機台狀況固定在下方永遠看得見 */
+.right-col { display: grid; grid-template-rows: 1fr auto; gap: 16px; min-height: 0; }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  padding: 18px 20px; overflow-y: auto; min-height: 0;
+}
+.panel.fixed { overflow: visible; }
+
+/* 批號詳情可以捲，動作按鈕永遠釘在面板底部 ——
+   大字回饋一出現版面就被往下推，按鈕掉到摺線下面是現場最容易漏按的地方 */
+#lot-panel { display: grid; grid-template-rows: auto 1fr auto; overflow: hidden; }
+#lot-body { overflow-y: auto; min-height: 0; }
+.panel-title { color: var(--muted); font-size: 16px; letter-spacing: 1px; margin-bottom: 12px; }
+.empty-hint { color: var(--muted); font-size: 22px; padding: 36px 0; text-align: center; }
+
+.lot-id { font-size: 42px; font-weight: 700; letter-spacing: 1px; }
+.lot-meta { display: flex; flex-wrap: wrap; gap: 10px 26px; margin-top: 12px; font-size: 19px; }
+.lot-meta span { color: var(--muted); }
+.lot-meta b { color: var(--text); font-size: 22px; }
+
+.tag {
+  display: inline-block; padding: 4px 14px; border-radius: 999px;
+  font-size: 17px; border: 2px solid var(--line); color: var(--muted);
+}
+.tag.WAITING, .tag.STANDBY { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.tag.RUNNING, .tag.PRODUCTIVE { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+.tag.HOLD, .tag.UNSCHEDULED_DOWN { color: var(--bad); border-color: var(--bad); background: var(--bad-soft); }
+.tag.SCHEDULED_DOWN, .tag.CRITICAL, .tag.URGENT { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+
+.checks { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
+.check { display: flex; gap: 10px; align-items: flex-start; font-size: 18px; line-height: 1.5; }
+.check .icon { flex: none; font-size: 20px; width: 26px; }
+.check.block { color: var(--bad); }
+.check.warn { color: var(--warn); }
+.check.ok { color: var(--muted); }
+
+/* ── 動作按鈕 ─────────────────────────────────────── */
+.actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+.actions button {
+  flex: 1 1 200px; min-height: 76px; font-size: 26px; font-weight: 700;
+  border-radius: 12px; border: 0; cursor: pointer;
+  background: var(--panel-2); color: var(--text); border: 2px solid var(--line);
+}
+.actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.actions button.danger { background: transparent; border-color: var(--bad); color: var(--bad); }
+.actions button:disabled { opacity: .4; cursor: not-allowed; }
+
+/* ── 佇列 ─────────────────────────────────────────── */
+.queue { display: flex; flex-direction: column; gap: 10px; }
+.queue-item {
+  display: flex; align-items: center; gap: 14px; padding: 14px 16px;
+  background: var(--panel-2); border: 2px solid var(--line); border-radius: 10px;
+  cursor: pointer; min-height: 64px;
+}
+.queue-item:hover { border-color: var(--accent); }
+.queue-item.CRITICAL { border-color: var(--bad); }
+.queue-item.URGENT { border-color: var(--warn); }
+.queue-item .qid { font-size: 22px; font-weight: 700; }
+.queue-item .qmeta { color: var(--muted); font-size: 16px; margin-left: auto; text-align: right; }
+
+.eq-status { display: flex; flex-direction: column; gap: 10px; font-size: 18px; }
+.eq-status .row { display: flex; justify-content: space-between; gap: 16px; }
+.eq-status .row span { color: var(--muted); }
+
+/* ── 機台選擇 ─────────────────────────────────────── */
+#pick h2 { margin: 0; padding: 20px 20px 0; font-size: 26px; font-weight: 600; }
+.station-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px; padding: 0 20px 20px; overflow-y: auto;
+}
+.station-card {
+  background: var(--panel); border: 2px solid var(--line); border-radius: 12px;
+  padding: 18px; cursor: pointer; min-height: 120px;
+}
+.station-card:hover { border-color: var(--accent); }
+.station-card .sid { font-size: 26px; font-weight: 700; }
+.station-card .sname { color: var(--muted); font-size: 17px; margin: 6px 0 10px; }
+
+/* ── 彈出視窗 ─────────────────────────────────────── */
+.modal { position: fixed; inset: 0; background: rgba(0, 0, 0, .72); align-items: center; justify-content: center; }
+.modal.active { display: flex; }
+.modal-box {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  padding: 28px; width: min(680px, 94vw); max-height: 92vh; overflow-y: auto;
+}
+.modal-box.wide { width: min(900px, 94vw); }
+.modal-box h2 { margin: 0 0 16px; font-size: 28px; }
+.to-summary { color: var(--muted); font-size: 19px; margin-bottom: 18px; line-height: 1.6; }
+
+.numpad-row { display: flex; gap: 14px; }
+.field { flex: 1; margin-bottom: 14px; }
+.field label { display: block; color: var(--muted); font-size: 17px; margin-bottom: 6px; }
+.field input, .field select {
+  width: 100%; font-size: 30px; padding: 14px 16px; border-radius: 10px;
+  border: 2px solid var(--line); background: var(--panel-2); color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+.field input.target { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* 觸控螢幕通常沒有實體鍵盤，也不想叫出系統小鍵盤蓋住畫面 */
+.numpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 8px 0 18px; }
+.numpad button {
+  min-height: 66px; font-size: 28px; font-weight: 700; border-radius: 10px;
+  border: 2px solid var(--line); background: var(--panel-2); color: var(--text); cursor: pointer;
+}
+.numpad button:active { background: var(--accent); border-color: var(--accent); }
+
+.modal-actions { display: flex; gap: 12px; justify-content: flex-end; }
+.modal-actions button {
+  min-height: 62px; min-width: 160px; font-size: 22px; font-weight: 700;
+  border-radius: 10px; cursor: pointer;
+  background: transparent; border: 2px solid var(--line); color: var(--text);
+}
+.modal-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.sop-body { font-size: 19px; line-height: 1.75; }
+.sop-body ol { padding-left: 24px; }
+.sop-body li { margin-bottom: 12px; }
+.sop-body .cp { color: var(--muted); font-size: 17px; }

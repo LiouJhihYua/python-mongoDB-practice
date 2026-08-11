@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>現場終端機 — OSAT MES</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b6fbd'/%3E%3Crect x='7' y='7' width='18' height='18' rx='2' fill='none' stroke='%23ffffff' stroke-width='2'/%3E%3Crect x='13' y='13' width='6' height='6' fill='%23ffffff'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/terminal.css" />
+</head>
+<body>
+
+<!-- ── 登入 ─────────────────────────────────────────── -->
+<!-- 一張 Token 有效 8 小時＝一個班別，所以一個班只需要登入一次。
+     帳號欄位可以直接掃工號條碼，密碼仍要輸入 —— 免密碼快速切換
+     需要搭配識別證讀卡機，那屬於門禁整合的範圍。 -->
+<section id="login" class="screen">
+  <form class="login-box" id="login-form">
+    <h1>現場終端機</h1>
+    <label for="u">帳號（可掃工號條碼）</label>
+    <input id="u" autocomplete="username" autofocus />
+    <label for="p">密碼</label>
+    <input id="p" type="password" autocomplete="current-password" />
+    <button type="submit">登入</button>
+    <div class="hint" id="login-hint">示範帳號：op001 / op0011234</div>
+  </form>
+</section>
+
+<!-- ── 選機台 ───────────────────────────────────────── -->
+<section id="pick" class="screen">
+  <header class="bar">
+    <div class="who">作業員：<b id="pick-who">-</b></div>
+    <button class="ghost" id="pick-logout">登出</button>
+  </header>
+  <h2>請選擇機台，或直接掃描機台條碼</h2>
+  <div class="scan-row">
+    <input id="pick-scan" placeholder="掃描機台條碼…" autocomplete="off" />
+  </div>
+  <div class="station-grid" id="station-grid"></div>
+</section>
+
+<!-- ── 工作台 ───────────────────────────────────────── -->
+<section id="work" class="screen">
+  <header class="bar">
+    <div class="eq">
+      <b id="eq-name">-</b>
+      <span class="tag" id="eq-state">-</span>
+    </div>
+    <div class="who">作業員：<b id="work-who">-</b></div>
+    <div class="clock" id="clock">--:--:--</div>
+    <button class="ghost" id="change-eq">換機台</button>
+    <button class="ghost" id="work-logout">登出</button>
+  </header>
+
+  <div class="scan-row big">
+    <input id="scan" placeholder="掃描批號 / 治具 / 載具…" autocomplete="off" autofocus />
+    <button class="ghost" id="scan-clear">清除</button>
+  </div>
+
+  <!-- 掃描或操作的結果，用大字回饋；現場站著看，小字沒有意義 -->
+  <div id="banner" class="banner"></div>
+
+  <div class="cols">
+    <div class="panel" id="lot-panel">
+      <div class="panel-title">目前批號</div>
+      <div id="lot-body" class="empty-hint">尚未掃描批號</div>
+      <div id="lot-actions" class="actions"></div>
+    </div>
+
+    <!-- 佇列可以捲，但機台狀況（治具壽命／配方／待簽 SOP）必須永遠看得到，
+         所以拆成兩個面板而不是同一個捲動區 -->
+    <div class="right-col">
+      <div class="panel">
+        <div class="panel-title">待進站佇列 <small id="queue-count"></small></div>
+        <div id="queue" class="queue"></div>
+      </div>
+      <div class="panel fixed">
+        <div class="panel-title">機台狀況</div>
+        <div id="eq-status" class="eq-status"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── 出站輸入 ─────────────────────────────────────── -->
+<section id="trackout" class="screen modal">
+  <div class="modal-box">
+    <h2>出站回報 — <span id="to-lot"></span></h2>
+    <div class="to-summary" id="to-summary"></div>
+    <div class="numpad-row">
+      <div class="field">
+        <label>良品數</label>
+        <input id="to-good" inputmode="numeric" />
+      </div>
+      <div class="field">
+        <label>不良數</label>
+        <input id="to-reject" inputmode="numeric" />
+      </div>
+    </div>
+    <div class="field" id="to-defect-wrap" hidden>
+      <label>不良代碼</label>
+      <select id="to-defect"></select>
+    </div>
+    <div class="numpad" id="numpad"></div>
+    <div class="modal-actions">
+      <button class="ghost" id="to-cancel">取消</button>
+      <button class="primary" id="to-submit">確認出站</button>
+    </div>
+  </div>
+</section>
+
+<!-- ── SOP 簽認 ─────────────────────────────────────── -->
+<section id="sop" class="screen modal">
+  <div class="modal-box wide">
+    <h2 id="sop-title">作業指導書</h2>
+    <div id="sop-body" class="sop-body"></div>
+    <div class="modal-actions">
+      <button class="ghost" id="sop-cancel">關閉</button>
+      <button class="primary" id="sop-ack">我已閱讀並簽認</button>
+    </div>
+  </div>
+</section>
+
+<script src="/static/terminal.js"></script>
+</body>
+</html>

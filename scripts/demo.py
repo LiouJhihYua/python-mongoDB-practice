@@ -2,7 +2,8 @@
 
 不需要事先安裝 PostgreSQL —— pgserver 會就地啟動一個實例：
 
-    python -m scripts.demo            # http://127.0.0.1:8000
+    python -m scripts.demo            # 看板 http://127.0.0.1:8000
+                                      # 終端機 http://127.0.0.1:8000/terminal
     python -m scripts.demo --days 5   # 模擬 5 天份的生產資料
     python -m scripts.demo --keep     # 沿用上次的資料，不重新產生
 """
@@ -46,7 +47,8 @@ def main() -> None:
 
     startup_hooks.append(load_demo_data)
     print(f"\n展示模式啟動中，請稍候（內嵌 PostgreSQL，模擬 {args.days} 天生產資料）…")
-    print(f"完成後開啟 http://{args.host}:{args.port}  帳號 admin / admin1234\n")
+    print(f"完成後開啟 http://{args.host}:{args.port}           戰情看板  admin / admin1234")
+    print(f"          或 http://{args.host}:{args.port}/terminal  現場終端機 op001 / op0011234\n")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

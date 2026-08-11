@@ -33,6 +33,7 @@ from app.routers import (
     secs,
     sop,
     spc,
+    terminal,
     tools,
     trace,
     wafermap,
@@ -146,7 +147,7 @@ for module in (
     auth, master, workorders, lots, dispatch, equipment, tools,
     quality, spc, materials, trace, reports, audit,
     wafermap, sop, erp, secs,
-    recipes, sampling, complaints,
+    recipes, sampling, complaints, terminal,
 ):
     app.include_router(module.router)
 
@@ -175,3 +176,8 @@ if STATIC_DIR.exists():
     @app.get("/", include_in_schema=False)
     async def index():
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/terminal", include_in_schema=False)
+    async def terminal_page():
+        """現場終端機：全螢幕、大字級，適合掛在機台旁邊的觸控螢幕。"""
+        return FileResponse(STATIC_DIR / "terminal.html")

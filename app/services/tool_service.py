@@ -178,8 +178,14 @@ async def replace(db, old_tool_id: str, new_tool_id: str, actor: str, remark: st
 def _decorate(row: dict) -> dict:
     limit = int(row.get("life_limit") or 0)
     used = int(row.get("used_count") or 0)
-    row["usage_ratio"] = round(used / limit, 4) if limit else 0.0
+    ratio = round(used / limit, 4) if limit else 0.0
+    row["usage_ratio"] = ratio
     row["remaining"] = max(0, limit - used)
+    # 「該換了」的判定只有一份，放在這裡讓看板、終端機與報表都拿到同一個答案
+    row["needs_attention"] = bool(
+        row.get("status") == ToolStatus.EXPIRED.value
+        or (limit and ratio >= float(row.get("warning_ratio") or 1.0))
+    )
     return row
 
 
